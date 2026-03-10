@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Market Intel Agent</title>
+  <meta name="description" content="AI-powered market trend analysis with live news data. Analyze any product category for trend velocity, pricing forecasts, and brand intelligence.">
+  <link rel="stylesheet" href="/static/style.css?v=20260306e">
+</head>
+<body>
+  <div class="app">
+    <header class="header">
+      <div class="logo">
+        <div class="logo-icon">MI</div>
+        <span class="logo-name">Market <span>Intel</span></span>
+      </div>
+      <div class="header-badge" id="header-year">Market Intelligence</div>
+    </header>
+
+    <main class="main">
+      <div class="hero">
+        <h1>What's <em>trending</em> next?</h1>
+        <p>AI-powered trend analysis with live news data from NewsAPI.org and Google Trends, plus AI forecasting for forward-looking signals.</p>
+      </div>
+
+      <div style="margin-bottom:40px">
+        <div class="search-box">
+          <input id="search-input" placeholder="e.g. wireless earbuds, skincare, electric bikes…">
+          <button class="run-btn" id="run-btn">Analyze →</button>
+        </div>
+        <div class="quick-tags" id="quick-tags"></div>
+      </div>
+
+      <!-- Loading -->
+      <div class="loading-wrap hidden" id="loading-section">
+        <div class="loading-ring"></div>
+        <div class="loading-steps-list" id="loading-steps"></div>
+      </div>
+
+      <!-- Error -->
+      <div class="error-box hidden" id="error-section">⚠ <span id="error-msg"></span></div>
+
+      <!-- Results -->
+      <div class="results hidden" id="results-section"></div>
+    </main>
+  </div>
+
+  <script src="/static/app.js?v=20260307e"></script>
+</body>
+</html>
+
+
+

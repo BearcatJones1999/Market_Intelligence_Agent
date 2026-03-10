@@ -1,0 +1,2515 @@
+﻿"""
+# Market Intel Agent - FastAPI backend
+Run with:  uvicorn main3:app --reload
+"""
+import os
+import json
+import math
+import asyncio
+import base64
+import sqlite3
+from datetime import datetime, timedelta
+from pathlib import Path
+try:
+    from dotenv import load_dotenv
+except Exception:
+    def load_dotenv(*args, **kwargs):
+        return False
+from anyio import to_thread
+from pytrends.request import TrendReq
+import pandas as pd
+
+# Always load .env from the same folder as this file
+load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
+
+import httpx
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, JSONResponse
+
+# Config 
+NEWS_API_KEY = os.getenv("NEWS_API_KEY")  # recommend env-only
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # recommend env-only
+EBAY_CLIENT_ID = os.getenv("EBAY_CLIENT_ID")
+EBAY_CLIENT_SECRET = os.getenv("EBAY_CLIENT_SECRET")
+EBAY_ENV = os.getenv("EBAY_ENV", "sandbox").lower()
+EBAY_MARKETPLACE = os.getenv("EBAY_MARKETPLACE", "EBAY_US")
+EBAY_SCOPE = os.getenv("EBAY_SCOPE", "https://api.ebay.com/oauth/api_scope")
+PRICE_DB_PATH = os.getenv("PRICE_DB_PATH", "data/price_history.db")
+ZIP3_LOOKUP_URL = os.getenv(
+    "ZIP3_LOOKUP_URL",
+    "https://raw.githubusercontent.com/billfienberg/zip3/master/threeDigitZipCodes.json",
+)
+
+# You can change this default model later
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+WTO_PRIMARY_KEY = os.getenv("WTO_PRIMARY_KEY")
+WTO_SECONDARY_KEY = os.getenv("WTO_SECONDARY_KEY")
+WTO_BASE_URL = os.getenv("WTO_BASE_URL", "https://api.wto.org/timeseries/v1")
+WTO_REPORTER_CODE = os.getenv("WTO_REPORTER_CODE", "840")  # USA
+WTO_DEFAULT_YEARS = int(os.getenv("WTO_DEFAULT_YEARS", "5"))
+
+_ebay_token_cache = {"token": None, "expires_at": datetime.min}
+_zip3_lookup_cache = {"data": None, "expires_at": datetime.min}
+_trends_cache = {}
+_trends_inflight = {}
+_wto_cache = {}
+_wto_partner_infer_cache = {}
+_TRENDS_CACHE_TTL_SECONDS = 900
+_TRENDS_CACHE_STALE_MAX_SECONDS = 86400
+_WTO_CACHE_TTL_SECONDS = 21600
+_WTO_PARTNER_INFER_TTL_SECONDS = 86400
+
+
+def _ebay_base_url() -> str:
+    return "https://api.ebay.com" if EBAY_ENV == "production" else "https://api.sandbox.ebay.com"
+
+
+def _ebay_token_url() -> str:
+    return f"{_ebay_base_url()}/identity/v1/oauth2/token"
+
+
+def _wto_headers(primary: bool = True) -> dict:
+    key = WTO_PRIMARY_KEY if primary else WTO_SECONDARY_KEY
+    return {"Ocp-Apim-Subscription-Key": key} if key else {}
+
+
+def _safe_float(value):
+    try:
+        v = float(value)
+        if math.isfinite(v):
+            return v
+    except Exception:
+        pass
+    return None
+
+
+def _summarize_series(rows: list) -> dict | None:
+    if not isinstance(rows, list) or not rows:
+        return None
+    cleaned = []
+    for r in rows:
+        try:
+            y = int(r.get("Year"))
+            p = str(r.get("PeriodCode") or "")
+            sort_period = int(p[1:]) if p.startswith("M") and p[1:].isdigit() else 0
+            v = _safe_float(r.get("Value"))
+            if v is None:
+                continue
+            cleaned.append((y, sort_period, v))
+        except Exception:
+            continue
+    if not cleaned:
+        return None
+    cleaned.sort(key=lambda x: (x[0], x[1]))
+    values = [c[2] for c in cleaned]
+    latest = cleaned[-1]
+    return {
+        "latestYear": latest[0],
+        "latestPeriodCode": f"M{latest[1]:02d}" if latest[1] else None,
+        "latestValue": round(latest[2], 3),
+        "mean": round(sum(values) / len(values), 3),
+        "min": round(min(values), 3),
+        "max": round(max(values), 3),
+        "count": len(values),
+    }
+
+
+async def _wto_get_json(path: str, params: dict) -> dict | None:
+    url = f"{WTO_BASE_URL.rstrip('/')}/{path.lstrip('/')}"
+    for use_primary in (True, False):
+        headers = _wto_headers(primary=use_primary)
+        if not headers:
+            continue
+        try:
+            async with httpx.AsyncClient(timeout=12) as client:
+                resp = await client.get(url, headers=headers, params=params)
+            if resp.status_code == 200:
+                return resp.json()
+            # Try secondary key only when auth fails on primary.
+            if resp.status_code not in (401, 403):
+                return None
+        except Exception:
+            # Network failure on primary can still try secondary.
+            if not use_primary:
+                return None
+    return None
+
+
+_WTO_PARTNER_CODE_TO_NAME = {
+    "036": "Australia",
+    "076": "Brazil",
+    "124": "Canada",
+    "156": "China",
+    "158": "Chinese Taipei",
+    "170": "Colombia",
+    "250": "France",
+    "276": "Germany",
+    "356": "India",
+    "360": "Indonesia",
+    "372": "Ireland",
+    "380": "Italy",
+    "392": "Japan",
+    "410": "Korea, Republic of",
+    "458": "Malaysia",
+    "484": "Mexico",
+    "528": "Netherlands",
+    "554": "New Zealand",
+    "620": "Portugal",
+    "702": "Singapore",
+    "704": "Viet Nam",
+    "710": "South Africa",
+    "724": "Spain",
+    "300": "Greece",
+    "752": "Sweden",
+    "756": "Switzerland",
+    "764": "Thailand",
+    "784": "United Arab Emirates",
+    "826": "United Kingdom",
+}
+
+_WTO_PARTNER_KEYWORD_TO_CODE = {
+    "china": "156",
+    "canada": "124",
+    "mexico": "484",
+    "vietnam": "704",
+    "india": "356",
+    "japan": "392",
+    "uk": "826",
+    "united kingdom": "826",
+    "germany": "276",
+    "france": "250",
+    "italy": "380",
+    "south korea": "410",
+    "korea": "410",
+    "taiwan": "158",
+    # origin cues by product naming
+    "chianti": "380",
+    "prosecco": "380",
+    "barolo": "380",
+    "parmesan": "380",
+    "champagne": "250",
+    "cognac": "250",
+    "tequila": "484",
+    "mezcal": "484",
+    "sake": "392",
+    "scotch": "826",
+    "single malt": "826",
+    "manuka": "554",
+    # brand-origin hints
+    "bosch": "276",
+    "siemens": "276",
+    "miele": "276",
+    "samsung": "410",
+    "lg": "410",
+    "haier": "156",
+    "hisense": "156",
+    "whirlpool": "840",
+    "ge appliances": "840",
+}
+
+_WTO_PRODUCT_HINTS = [
+    (("running shoes", "trail shoes", "sneakers", "footwear"), ["704", "156", "360"]),
+    (("wine", "chianti", "prosecco", "barolo"), ["380", "250", "724"]),
+    (("tequila", "mezcal"), ["484"]),
+    (("coffee",), ["076", "170", "704"]),
+    (("olive oil",), ["380", "724", "300"]),
+    (("washing machine", "washer", "laundry machine"), ["276", "410", "156"]),
+]
+
+_WTO_HS_HINTS = [
+    (("running shoes", "trail shoes", "sneakers", "footwear"), ["640411", "640419", "6404"]),
+    (("washing machine", "washer", "laundry machine"), ["845011", "845020", "8450"]),
+    (("wine", "chianti", "prosecco", "barolo"), ["220421", "2204"]),
+    (("coffee", "espresso"), ["0901"]),
+    (("olive oil",), ["1509"]),
+    (("wireless earbuds", "earbuds", "headphones"), ["851830", "8518"]),
+]
+
+
+def _wto_partner_name(code: str) -> str:
+    return _WTO_PARTNER_CODE_TO_NAME.get(str(code), f"Code {code}")
+
+
+def _wto_partner_infer_cache_get(cache_key: str):
+    entry = _wto_partner_infer_cache.get(cache_key)
+    if not isinstance(entry, dict):
+        return None
+    fetched_at = entry.get("fetched_at")
+    payload = entry.get("payload")
+    if not isinstance(fetched_at, datetime) or not isinstance(payload, dict):
+        return None
+    age = (datetime.utcnow() - fetched_at).total_seconds()
+    if age <= _WTO_PARTNER_INFER_TTL_SECONDS:
+        return payload
+    return None
+
+
+def _wto_partner_infer_cache_put(cache_key: str, payload: dict):
+    if not isinstance(payload, dict):
+        return
+    _wto_partner_infer_cache[cache_key] = {"fetched_at": datetime.utcnow(), "payload": payload}
+
+
+async def _infer_wto_partners_with_model(product_query: str, max_partners: int = 3) -> list[dict]:
+    if not OPENAI_API_KEY:
+        return []
+    allowed = [{"code": c, "name": n} for c, n in _WTO_PARTNER_CODE_TO_NAME.items()]
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["partners"],
+        "properties": {
+            "partners": {
+                "type": "array",
+                "minItems": 0,
+                "maxItems": max_partners,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["code"],
+                    "properties": {
+                        "code": {"type": "string"},
+                        "reason": {"type": "string"},
+                    },
+                },
+            }
+        },
+    }
+    payload = {
+        "model": OPENAI_MODEL,
+        "input": [
+            {
+                "role": "system",
+                "content": (
+                    "Infer likely origin countries for US imports of the product query. "
+                    "Choose only from provided allowed partner codes. Keep it concise."
+                ),
+            },
+            {
+                "role": "user",
+                "content": "Product query: " + str(product_query),
+            },
+            {
+                "role": "user",
+                "content": "Allowed partner codes JSON:\n" + json.dumps(allowed, ensure_ascii=True),
+            },
+        ],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "wto_partner_infer",
+                "strict": True,
+                "schema": schema,
+            }
+        },
+        "max_output_tokens": 240,
+        "store": False,
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.post("https://api.openai.com/v1/responses", headers=headers, json=payload)
+        if resp.status_code != 200:
+            return []
+        txt = _extract_text_from_responses_api(resp.json()).strip()
+        parsed = json.loads(txt) if txt else {}
+        out = []
+        for p in parsed.get("partners") or []:
+            code = str((p or {}).get("code") or "").strip()
+            if code in _WTO_PARTNER_CODE_TO_NAME:
+                out.append({"code": code, "name": _wto_partner_name(code), "method": "model"})
+        dedup = []
+        seen = set()
+        for p in out:
+            c = p["code"]
+            if c in seen:
+                continue
+            seen.add(c)
+            dedup.append(p)
+        return dedup[:max_partners]
+    except Exception:
+        return []
+
+
+async def _infer_wto_partner_candidates(
+    product_query: str,
+    explicit_partner_code: str | None = None,
+    max_partners: int = 3,
+) -> dict:
+    if explicit_partner_code:
+        c = str(explicit_partner_code).strip()
+        return {
+            "method": "explicit",
+            "partners": [{"code": c, "name": _wto_partner_name(c), "method": "explicit"}],
+        }
+
+    q = (product_query or "").strip().lower()
+    cache_key = f"v3|{q}|{max_partners}"
+    cached = _wto_partner_infer_cache_get(cache_key)
+    if cached:
+        return cached
+
+    found = []
+    for kw, code in _WTO_PARTNER_KEYWORD_TO_CODE.items():
+        if kw in q and code in _WTO_PARTNER_CODE_TO_NAME:
+            found.append({"code": code, "name": _wto_partner_name(code), "method": "keyword"})
+    dedup = []
+    seen = set()
+    for p in found:
+        if p["code"] in seen:
+            continue
+        seen.add(p["code"])
+        dedup.append(p)
+    if dedup:
+        out = {"method": "keyword", "partners": dedup[:max_partners]}
+        _wto_partner_infer_cache_put(cache_key, out)
+        return out
+
+    hinted = []
+    for terms, codes in _WTO_PRODUCT_HINTS:
+        if any(t in q for t in terms):
+            for c in codes:
+                if c in _WTO_PARTNER_CODE_TO_NAME:
+                    hinted.append({"code": c, "name": _wto_partner_name(c), "method": "heuristic"})
+    if hinted:
+        dedup_hint = []
+        seen_hint = set()
+        for p in hinted:
+            if p["code"] in seen_hint:
+                continue
+            seen_hint.add(p["code"])
+            dedup_hint.append(p)
+        out = {"method": "heuristic", "partners": dedup_hint[:max_partners]}
+        _wto_partner_infer_cache_put(cache_key, out)
+        return out
+
+    model_partners = await _infer_wto_partners_with_model(product_query, max_partners=max_partners)
+    if model_partners:
+        out = {"method": "model", "partners": model_partners[:max_partners]}
+        _wto_partner_infer_cache_put(cache_key, out)
+        return out
+
+    out = {"method": "none", "partners": []}
+    _wto_partner_infer_cache_put(cache_key, out)
+    return out
+
+
+def _normalize_hs_code(hs_code: str) -> str | None:
+    digits = "".join(ch for ch in str(hs_code or "") if ch.isdigit())
+    if len(digits) >= 6:
+        return digits[:6]
+    if len(digits) in (2, 4):
+        return digits
+    return None
+
+
+def _hs_rollups(hs_code: str) -> list[str]:
+    hs = _normalize_hs_code(hs_code)
+    if not hs:
+        return []
+    out = [hs]
+    if len(hs) >= 6:
+        out.append(hs[:4])
+        out.append(hs[:2])
+    elif len(hs) == 4:
+        out.append(hs[:2])
+    dedup = []
+    seen = set()
+    for h in out:
+        if h in seen:
+            continue
+        seen.add(h)
+        dedup.append(h)
+    return dedup
+
+
+def _infer_wto_hs_candidates(product_query: str, explicit_hs_code: str | None = None, max_codes: int = 4) -> list[str]:
+    out = []
+    if explicit_hs_code:
+        norm = _normalize_hs_code(explicit_hs_code)
+        if norm:
+            out.append(norm)
+    q = (product_query or "").strip().lower()
+    for terms, codes in _WTO_HS_HINTS:
+        if any(t in q for t in terms):
+            for c in codes:
+                norm = _normalize_hs_code(c)
+                if norm:
+                    out.append(norm)
+    dedup = []
+    seen = set()
+    for c in out:
+        if c in seen:
+            continue
+        seen.add(c)
+        dedup.append(c)
+    return dedup[:max_codes]
+
+
+def _hs_category_label(hs_code: str | None) -> str:
+    hs = _normalize_hs_code(hs_code)
+    if not hs:
+        return "Not specified"
+    # Focused labels for the product groups used in this app's heuristics.
+    if hs.startswith("845011"):
+        return "Household Washing Machines (fully automatic)"
+    if hs.startswith("845020"):
+        return "Household Washing Machines (other types)"
+    if hs.startswith("8450"):
+        return "Laundry/Washing Machines (HS 8450)"
+    if hs.startswith("640411"):
+        return "Sports/Running Footwear (rubber/plastic soles)"
+    if hs.startswith("640419"):
+        return "Other Sports Footwear (HS 640419)"
+    if hs.startswith("6404"):
+        return "Footwear with outer soles of rubber/plastics (HS 6404)"
+    if hs.startswith("220421"):
+        return "Wine in containers <= 2 liters"
+    if hs.startswith("2204"):
+        return "Wine and Grape Must (HS 2204)"
+    if hs.startswith("0901"):
+        return "Coffee (HS 0901)"
+    if hs.startswith("1509"):
+        return "Olive Oil (HS 1509)"
+    if hs.startswith("851830"):
+        return "Headphones/Earphones (including wireless earbuds)"
+    if hs.startswith("8518"):
+        return "Microphones, speakers, headphones (HS 8518)"
+    return f"HS {hs}"
+
+
+def _pick_wto_tariff_indicator(hs_code: str | None, partner_code: str | None) -> tuple[str, str]:
+    if hs_code:
+        return ("HS_A_0010", "MFN tariff (HS-level)")
+    return ("TP_A_0010", "MFN tariff (all products)")
+
+
+def _wto_cache_get(cache_key: str):
+    entry = _wto_cache.get(cache_key)
+    if not isinstance(entry, dict):
+        return None
+    fetched_at = entry.get("fetched_at")
+    payload = entry.get("payload")
+    if not isinstance(fetched_at, datetime) or not isinstance(payload, dict):
+        return None
+    age = (datetime.utcnow() - fetched_at).total_seconds()
+    if age <= _WTO_CACHE_TTL_SECONDS:
+        return payload
+    return None
+
+
+def _wto_cache_put(cache_key: str, payload: dict):
+    if not isinstance(payload, dict):
+        return
+    _wto_cache[cache_key] = {"fetched_at": datetime.utcnow(), "payload": payload}
+
+
+async def _fetch_wto_trade_context(
+    years: int = WTO_DEFAULT_YEARS,
+    reporter_code: str = WTO_REPORTER_CODE,
+    product_query: str = "",
+    partner_code: str | None = None,
+    hs_code: str | None = None,
+    strict_targeted: bool = True,
+) -> dict:
+    """
+    Compact WTO tariff context for US imports from a specific partner/country.
+    Designed to minimize payload and call volume.
+    """
+    if not WTO_PRIMARY_KEY and not WTO_SECONDARY_KEY:
+        return {"warning": "WTO keys missing"}
+
+    inferred = await _infer_wto_partner_candidates(product_query, explicit_partner_code=partner_code, max_partners=3)
+    partner_candidates = [str((p or {}).get("code") or "").strip() for p in (inferred.get("partners") or [])]
+    partner_candidates = [p for p in partner_candidates if p]
+    hs_candidates = _infer_wto_hs_candidates(product_query, explicit_hs_code=hs_code, max_codes=4)
+
+    now = datetime.utcnow()
+    # Tariff series are annual and often lag current year by ~1-2 years.
+    year_to = max(2000, now.year - 2)
+    primary_year_from = max(1990, year_to - max(1, int(years)) + 1)
+    year_windows = []
+    for span in [max(1, int(years)), 7, 10]:
+        y_from = max(1990, year_to - span + 1)
+        year_windows.append((y_from, year_to))
+    # Deduplicate windows preserving order.
+    win_dedup = []
+    seen_w = set()
+    for w in year_windows:
+        if w in seen_w:
+            continue
+        seen_w.add(w)
+        win_dedup.append(w)
+    year_windows = win_dedup
+
+    primary_ps = ",".join(str(y) for y in range(primary_year_from, year_to + 1))
+    primary_partner = partner_candidates[0] if partner_candidates else None
+    primary_hs = hs_candidates[0] if hs_candidates else None
+    indicator, indicator_label = _pick_wto_tariff_indicator(primary_hs, primary_partner)
+    cache_key = f"{reporter_code}|{','.join(partner_candidates) or 'none'}|{','.join(hs_candidates) or 'default'}|{indicator}|{primary_ps}|strict={strict_targeted}"
+    cached = _wto_cache_get(cache_key)
+    if cached:
+        out = dict(cached)
+        out["cached"] = True
+        return out
+
+    def _build_attempt(i: str, p: str | None, pc: str, max_rows: str, ps: str) -> dict:
+        out = {
+            "i": i,
+            "r": str(reporter_code or "840"),
+            "ps": ps,
+            "pc": pc,
+            "spc": "false",
+            "fmt": "json",
+            "mode": "full",
+            "dec": "default",
+            "off": "0",
+            "max": max_rows,
+            "head": "H",
+            "lang": "1",
+            "meta": "false",
+        }
+        # Some indicators (e.g., TP_A_0010) do not have partner dimension.
+        if p:
+            out["p"] = p
+        return out
+
+    query_attempts = []
+    for (y_from, y_to) in year_windows:
+        ps = ",".join(str(y) for y in range(y_from, y_to + 1))
+        if hs_candidates:
+            for hs in hs_candidates:
+                for rolled_hs in _hs_rollups(hs):
+                    query_attempts.append(_build_attempt("HS_A_0010", None, rolled_hs, "60", ps))
+        else:
+            query_attempts.append(_build_attempt("TP_A_0010", None, "default", "40", ps))
+    if not strict_targeted:
+        # Optional broad fallback.
+        query_attempts.append(_build_attempt("TP_A_0010", None, "default", "40", primary_ps))
+
+    rows = []
+    used_params = None
+    for params in query_attempts:
+        payload = await _wto_get_json("data", params)
+        rows = (payload or {}).get("Dataset") or []
+        if rows:
+            used_params = params
+            break
+
+    summary = _summarize_series(rows)
+    if not summary:
+        return {
+            "warning": "WTO tariff data unavailable for requested scope",
+            "productQuery": product_query,
+            "reporterCode": str(reporter_code or "840"),
+            "partnerCode": primary_partner,
+            "partnerName": _wto_partner_name(primary_partner) if primary_partner else None,
+            "partnerCandidates": partner_candidates,
+            "partnerCandidateNames": [_wto_partner_name(c) for c in partner_candidates],
+            "partnerInferenceMethod": inferred.get("method"),
+            "hsCode": primary_hs,
+            "hsCandidates": hs_candidates,
+            "strictTargeted": bool(strict_targeted),
+            "indicator": indicator,
+            "periodRange": f"{primary_year_from}-{year_to}",
+        }
+
+    point_values = []
+    cleaned_rows = []
+    for r in rows:
+        val = _safe_float(r.get("Value"))
+        if val is None:
+            continue
+        y = int(r.get("Year") or 0)
+        cleaned_rows.append((y, val))
+        point_values.append(val)
+    cleaned_rows.sort(key=lambda t: t[0])
+    yoy_delta = None
+    if len(cleaned_rows) >= 2:
+        yoy_delta = round(cleaned_rows[-1][1] - cleaned_rows[-2][1], 3)
+
+    used_indicator = str((used_params or {}).get("i") or indicator)
+    used_label = (
+        "MFN tariff (HS-level)"
+        if used_indicator == "HS_A_0010"
+        else "MFN tariff (all products)"
+    )
+    used_partner_code = str((used_params or {}).get("p") or "")
+    used_partner_name = _wto_partner_name(used_partner_code) if used_partner_code else "n/a"
+    used_hs_code = str((used_params or {}).get("pc") or "default")
+    used_ps = str((used_params or {}).get("ps") or primary_ps)
+    used_indicator_hs_specific = used_hs_code not in ("", "default")
+    targeted_level = (
+        "hs_only"
+        if used_indicator_hs_specific
+        else "aggregate"
+    )
+    obs = int(summary.get("count") or 0)
+    confidence = "LOW"
+    if targeted_level == "hs_only" and obs >= 3:
+        confidence = "HIGH"
+    elif targeted_level == "hs_only" and obs >= 1:
+        confidence = "MEDIUM"
+
+    out = {
+        "source": "WTO Timeseries API",
+        "focus": "US import tariff (targeted)",
+        "productQuery": product_query,
+        "reporterCode": str(reporter_code or "840"),
+        "partnerCode": primary_partner,
+        "partnerName": _wto_partner_name(primary_partner) if primary_partner else None,
+        "partnerCandidates": partner_candidates,
+        "partnerCandidateNames": [_wto_partner_name(c) for c in partner_candidates],
+        "partnerInferenceMethod": inferred.get("method"),
+        "hsCode": primary_hs,
+        "hsCandidates": hs_candidates,
+        "strictTargeted": bool(strict_targeted),
+        "indicator": used_indicator,
+        "indicatorLabel": used_label,
+        "usedPartnerCode": used_partner_code or "n/a",
+        "usedPartnerName": used_partner_name,
+        "usedHsCode": used_hs_code,
+        "usedHsCategory": _hs_category_label(used_hs_code if used_hs_code != "default" else primary_hs),
+        "hsCategory": _hs_category_label(primary_hs),
+        "usedPeriodRange": used_ps,
+        "targetedMatchLevel": targeted_level,
+        "confidence": confidence,
+        "fallbackApplied": bool(
+            used_params
+            and (
+                used_params.get("i") != indicator
+                or str(used_params.get("pc") or "default") != str(primary_hs or "default")
+            )
+        ),
+        "periodRange": f"{primary_year_from}-{year_to}",
+        "latestTariffPercent": summary.get("latestValue"),
+        "latestYear": summary.get("latestYear"),
+        "yoyDeltaPctPts": yoy_delta,
+        "avgTariffPercent": summary.get("mean"),
+        "observations": summary.get("count"),
+        "retrievedAt": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+    }
+    _wto_cache_put(cache_key, out)
+    return out
+
+
+def _percentile(sorted_values, p: float) -> float:
+    if not sorted_values:
+        return 0.0
+    if len(sorted_values) == 1:
+        return float(sorted_values[0])
+    rank = (len(sorted_values) - 1) * p
+    low = int(math.floor(rank))
+    high = int(math.ceil(rank))
+    if low == high:
+        return float(sorted_values[low])
+    weight = rank - low
+    return float(sorted_values[low] * (1 - weight) + sorted_values[high] * weight)
+
+
+def _add_months(year: int, month: int, delta: int) -> tuple[int, int]:
+    total = (year * 12 + (month - 1)) + delta
+    out_year = total // 12
+    out_month = (total % 12) + 1
+    return out_year, out_month
+
+
+def _trends_cache_get(cache_key: str, max_age_seconds: int):
+    entry = _trends_cache.get(cache_key)
+    if not isinstance(entry, dict):
+        return None
+    fetched_at = entry.get("fetched_at")
+    payload = entry.get("payload")
+    if not isinstance(fetched_at, datetime) or not isinstance(payload, dict):
+        return None
+    age = (datetime.utcnow() - fetched_at).total_seconds()
+    if age <= float(max_age_seconds):
+        return payload
+    return None
+
+
+def _trends_cache_put(cache_key: str, payload: dict):
+    if not isinstance(payload, dict):
+        return
+    _trends_cache[cache_key] = {"fetched_at": datetime.utcnow(), "payload": payload}
+
+
+def _normalize_pricing_monthly_history(pricing: dict) -> None:
+    history = pricing.get("monthlyHistory")
+    if not isinstance(history, list) or not history:
+        return
+
+    n = len(history)
+    projected_count = sum(1 for p in history if bool((p or {}).get("projected")))
+    if projected_count <= 0:
+        projected_count = max(3, n // 4)
+    projected_count = max(1, min(projected_count, n - 1))
+    hist_count = n - projected_count
+
+    parsed_prices = []
+    for point in history:
+        try:
+            parsed_prices.append(float((point or {}).get("price")))
+        except Exception:
+            continue
+
+    fallback = float(pricing.get("currentAvgPrice") or 0.0)
+    if fallback <= 0 and parsed_prices:
+        fallback = parsed_prices[-1]
+    if fallback <= 0:
+        fallback = 1.0
+
+    while len(parsed_prices) < n:
+        parsed_prices.append(fallback)
+
+    today = datetime.utcnow().date()
+    cy, cm = today.year, today.month
+    rebuilt = []
+    for i in range(n):
+        month_delta = i - (hist_count - 1)
+        y, m = _add_months(cy, cm, month_delta)
+        rebuilt.append(
+            {
+                "month": f"{y:04d}-{m:02d}",
+                "price": round(float(parsed_prices[i]), 2),
+                "projected": i >= hist_count,
+            }
+        )
+
+    pricing["monthlyHistory"] = rebuilt
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def _reconcile_live_pricing_with_forecast(pricing: dict) -> None:
+    try:
+        current = float(pricing.get("currentAvgPrice") or 0)
+    except Exception:
+        current = 0.0
+    if current <= 0:
+        return
+
+    try:
+        f12 = float(pricing.get("forecastAvgPrice12mo") or current)
+    except Exception:
+        f12 = current
+    try:
+        f24 = float(pricing.get("forecastAvgPrice24mo") or f12)
+    except Exception:
+        f24 = f12
+
+    f12 = _clamp(f12, current * 0.85, current * 1.30)
+    f24 = _clamp(f24, current * 0.70, current * 1.60)
+
+    pricing["forecastAvgPrice12mo"] = round(f12, 2)
+    pricing["forecastAvgPrice24mo"] = round(f24, 2)
+    pricing["priceChangeYoY"] = round(((f12 - current) / current) * 100, 1)
+
+    if f12 >= current * 1.03:
+        pricing["priceTrend"] = "RISING"
+    elif f12 <= current * 0.97:
+        pricing["priceTrend"] = "FALLING"
+    else:
+        pricing["priceTrend"] = "STABLE"
+
+    if f24 >= current * 1.08:
+        pricing["priceOutlook"] = "BULLISH"
+    elif f24 <= current * 0.92:
+        pricing["priceOutlook"] = "BEARISH"
+    else:
+        pricing["priceOutlook"] = "NEUTRAL"
+
+
+def _price_db_conn():
+    db_path = Path(PRICE_DB_PATH)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS daily_price_snapshots (
+          category_key TEXT NOT NULL,
+          obs_date TEXT NOT NULL,
+          avg_price REAL NOT NULL,
+          low_price REAL,
+          high_price REAL,
+          sample_size INTEGER,
+          source TEXT,
+          created_at TEXT NOT NULL,
+          PRIMARY KEY (category_key, obs_date)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS weekly_price_points (
+          category_key TEXT NOT NULL,
+          week_start TEXT NOT NULL,
+          avg_price REAL NOT NULL,
+          sample_size INTEGER,
+          source TEXT,
+          created_at TEXT NOT NULL,
+          PRIMARY KEY (category_key, week_start)
+        )
+        """
+    )
+    return conn
+
+
+def _category_key(text: str) -> str:
+    return " ".join((text or "").strip().lower().split())
+
+
+def _record_price_snapshot(category: str, pricing: dict) -> None:
+    try:
+        avg = float(pricing.get("currentAvgPrice") or 0)
+    except Exception:
+        avg = 0.0
+    if avg <= 0:
+        return
+
+    try:
+        low = float(pricing.get("typicalPriceRangeLow") or avg)
+    except Exception:
+        low = avg
+    try:
+        high = float(pricing.get("typicalPriceRangeHigh") or avg)
+    except Exception:
+        high = avg
+
+    source = str(pricing.get("liveSource") or "unknown")
+    sample = int(pricing.get("liveSampleSize") or 0)
+    today = datetime.utcnow().date().isoformat()
+    now_iso = datetime.utcnow().isoformat(timespec="seconds")
+
+    conn = _price_db_conn()
+    try:
+        conn.execute(
+            """
+            INSERT INTO daily_price_snapshots
+              (category_key, obs_date, avg_price, low_price, high_price, sample_size, source, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(category_key, obs_date) DO UPDATE SET
+              avg_price=excluded.avg_price,
+              low_price=excluded.low_price,
+              high_price=excluded.high_price,
+              sample_size=excluded.sample_size,
+              source=excluded.source,
+              created_at=excluded.created_at
+            """,
+            (_category_key(category), today, avg, low, high, sample, source, now_iso),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _load_monthly_price_averages(category: str, months_back: int = 48) -> dict:
+    conn = _price_db_conn()
+    try:
+        cutoff = (datetime.utcnow().date() - timedelta(days=max(60, months_back * 31))).isoformat()
+        rows = conn.execute(
+            """
+            SELECT substr(obs_date, 1, 7) AS ym, avg(avg_price) AS avg_month_price
+            FROM daily_price_snapshots
+            WHERE category_key = ? AND obs_date >= ?
+            GROUP BY ym
+            ORDER BY ym
+            """,
+            (_category_key(category), cutoff),
+        ).fetchall()
+    finally:
+        conn.close()
+    return {str(r[0]): float(r[1]) for r in rows if r[0] is not None and r[1] is not None}
+
+
+def _load_recent_snapshots(category: str, days: int = 365) -> list:
+    conn = _price_db_conn()
+    try:
+        cutoff = (datetime.utcnow().date() - timedelta(days=max(1, int(days)))).isoformat()
+        rows = conn.execute(
+            """
+            SELECT obs_date, avg_price, low_price, high_price, sample_size, source
+            FROM daily_price_snapshots
+            WHERE category_key = ? AND obs_date >= ?
+            ORDER BY obs_date ASC
+            """,
+            (_category_key(category), cutoff),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [
+        {
+            "date": r[0],
+            "avgPrice": float(r[1]),
+            "lowPrice": float(r[2]) if r[2] is not None else None,
+            "highPrice": float(r[3]) if r[3] is not None else None,
+            "sampleSize": int(r[4]) if r[4] is not None else 0,
+            "source": str(r[5] or ""),
+        }
+        for r in rows
+    ]
+
+
+def _week_start_iso(date_text: str) -> str:
+    d = datetime.fromisoformat(date_text).date()
+    week_start = d - timedelta(days=d.weekday())
+    return week_start.isoformat()
+
+
+def _record_weekly_sold_points(category: str, sold_points: list, source: str) -> None:
+    if not sold_points:
+        return
+    buckets = {}
+    for p in sold_points:
+        try:
+            d = str((p or {}).get("date") or "").strip()
+            price = float((p or {}).get("price"))
+        except Exception:
+            continue
+        if not d or price <= 0:
+            continue
+        try:
+            wk = _week_start_iso(d)
+        except Exception:
+            continue
+        if wk not in buckets:
+            buckets[wk] = []
+        buckets[wk].append(price)
+
+    if not buckets:
+        return
+
+    now_iso = datetime.utcnow().isoformat(timespec="seconds")
+    conn = _price_db_conn()
+    try:
+        for wk, vals in buckets.items():
+            avg_price = round(sum(vals) / len(vals), 2)
+            conn.execute(
+                """
+                INSERT INTO weekly_price_points
+                  (category_key, week_start, avg_price, sample_size, source, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(category_key, week_start) DO UPDATE SET
+                  avg_price=excluded.avg_price,
+                  sample_size=excluded.sample_size,
+                  source=excluded.source,
+                  created_at=excluded.created_at
+                """,
+                (_category_key(category), wk, avg_price, len(vals), source, now_iso),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _load_weekly_price_series(category: str, weeks_back: int = 156) -> dict:
+    conn = _price_db_conn()
+    try:
+        cutoff = (datetime.utcnow().date() - timedelta(days=max(28, int(weeks_back) * 7))).isoformat()
+        rows = conn.execute(
+            """
+            SELECT week_start, avg_price
+            FROM weekly_price_points
+            WHERE category_key = ? AND week_start >= ?
+            ORDER BY week_start
+            """,
+            (_category_key(category), cutoff),
+        ).fetchall()
+    finally:
+        conn.close()
+    return {str(r[0]): float(r[1]) for r in rows if r[0] is not None and r[1] is not None}
+
+
+def _load_recent_weekly_points(category: str, weeks: int = 156) -> list:
+    conn = _price_db_conn()
+    try:
+        cutoff = (datetime.utcnow().date() - timedelta(days=max(28, int(weeks) * 7))).isoformat()
+        rows = conn.execute(
+            """
+            SELECT week_start, avg_price, sample_size, source
+            FROM weekly_price_points
+            WHERE category_key = ? AND week_start >= ?
+            ORDER BY week_start ASC
+            """,
+            (_category_key(category), cutoff),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [
+        {
+            "weekStart": r[0],
+            "avgPrice": float(r[1]),
+            "sampleSize": int(r[2]) if r[2] is not None else 0,
+            "source": str(r[3] or ""),
+        }
+        for r in rows
+    ]
+
+
+def _build_expanded_weekly_history(category: str, pricing: dict, hist_weeks: int = 104, proj_weeks: int = 52) -> list:
+    weekly_obs = _load_weekly_price_series(category, weeks_back=max(hist_weeks + 26, 156))
+    try:
+        current = float(pricing.get("currentAvgPrice") or 0)
+    except Exception:
+        current = 0.0
+    if current <= 0:
+        current = 1.0
+    try:
+        f24 = float(pricing.get("forecastAvgPrice24mo") or current)
+    except Exception:
+        f24 = current
+
+    today = datetime.utcnow().date()
+    current_week = today - timedelta(days=today.weekday())
+
+    points = []
+    last_price = current
+    for i in range(-(hist_weeks - 1), proj_weeks + 1):
+        wk = current_week + timedelta(days=i * 7)
+        wk_iso = wk.isoformat()
+        projected = i > 0
+        if projected:
+            t = i / max(1, proj_weeks)
+            price = current + (f24 - current) * t
+        else:
+            if wk_iso in weekly_obs:
+                price = weekly_obs[wk_iso]
+                last_price = price
+            else:
+                price = last_price
+        points.append({"month": wk_iso, "price": round(float(price), 2), "projected": projected})
+    return points
+
+
+def _build_expanded_monthly_history(category: str, pricing: dict, hist_months: int = 36, proj_months: int = 24) -> list:
+    monthly_obs = _load_monthly_price_averages(category, months_back=max(hist_months + 12, 48))
+    try:
+        current = float(pricing.get("currentAvgPrice") or 0)
+    except Exception:
+        current = 0.0
+    if current <= 0:
+        current = 1.0
+    try:
+        f24 = float(pricing.get("forecastAvgPrice24mo") or current)
+    except Exception:
+        f24 = current
+
+    today = datetime.utcnow().date()
+    cy, cm = today.year, today.month
+
+    points = []
+    last_price = current
+    for i in range(-(hist_months - 1), proj_months + 1):
+        y, m = _add_months(cy, cm, i)
+        ym = f"{y:04d}-{m:02d}"
+        projected = i > 0
+        if projected:
+            t = i / max(1, proj_months)
+            price = current + (f24 - current) * t
+        else:
+            if ym in monthly_obs:
+                price = monthly_obs[ym]
+                last_price = price
+            else:
+                price = last_price
+        points.append({"month": ym, "price": round(float(price), 2), "projected": projected})
+    return points
+
+
+async def _get_ebay_token() -> str:
+    if not EBAY_CLIENT_ID or not EBAY_CLIENT_SECRET:
+        raise RuntimeError("Missing EBAY_CLIENT_ID or EBAY_CLIENT_SECRET")
+
+    now = datetime.utcnow()
+    token = _ebay_token_cache.get("token")
+    expires_at = _ebay_token_cache.get("expires_at", datetime.min)
+    if token and isinstance(expires_at, datetime) and expires_at > now + timedelta(seconds=60):
+        return token
+
+    basic_raw = f"{EBAY_CLIENT_ID}:{EBAY_CLIENT_SECRET}".encode("utf-8")
+    basic = base64.b64encode(basic_raw).decode("ascii")
+    headers = {
+        "Authorization": f"Basic {basic}",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    data = {"grant_type": "client_credentials", "scope": EBAY_SCOPE}
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.post(_ebay_token_url(), headers=headers, data=data)
+
+    if resp.status_code != 200:
+        raise RuntimeError(f"eBay token error: {resp.status_code}")
+
+    payload = resp.json()
+    access_token = payload.get("access_token")
+    expires_in = int(payload.get("expires_in", 7200))
+    if not access_token:
+        raise RuntimeError("eBay token missing access_token")
+
+    _ebay_token_cache["token"] = access_token
+    _ebay_token_cache["expires_at"] = now + timedelta(seconds=max(60, expires_in - 60))
+    return access_token
+
+
+_US_STATE_NAME_TO_ABBR = {
+    "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR", "california": "CA",
+    "colorado": "CO", "connecticut": "CT", "delaware": "DE", "district of columbia": "DC",
+    "florida": "FL", "georgia": "GA", "hawaii": "HI", "idaho": "ID", "illinois": "IL",
+    "indiana": "IN", "iowa": "IA", "kansas": "KS", "kentucky": "KY", "louisiana": "LA",
+    "maine": "ME", "maryland": "MD", "massachusetts": "MA", "michigan": "MI", "minnesota": "MN",
+    "mississippi": "MS", "missouri": "MO", "montana": "MT", "nebraska": "NE", "nevada": "NV",
+    "new hampshire": "NH", "new jersey": "NJ", "new mexico": "NM", "new york": "NY",
+    "north carolina": "NC", "north dakota": "ND", "ohio": "OH", "oklahoma": "OK", "oregon": "OR",
+    "pennsylvania": "PA", "rhode island": "RI", "south carolina": "SC", "south dakota": "SD",
+    "tennessee": "TN", "texas": "TX", "utah": "UT", "vermont": "VT", "virginia": "VA",
+    "washington": "WA", "west virginia": "WV", "wisconsin": "WI", "wyoming": "WY",
+}
+_US_STATE_ABBRS = set(_US_STATE_NAME_TO_ABBR.values())
+_STATE_TO_REGION = {
+    "CT": "Northeast", "ME": "Northeast", "MA": "Northeast", "NH": "Northeast", "RI": "Northeast", "VT": "Northeast",
+    "NJ": "Northeast", "NY": "Northeast", "PA": "Northeast",
+    "IL": "Midwest", "IN": "Midwest", "MI": "Midwest", "OH": "Midwest", "WI": "Midwest",
+    "IA": "Midwest", "KS": "Midwest", "MN": "Midwest", "MO": "Midwest", "NE": "Midwest", "ND": "Midwest", "SD": "Midwest",
+    "DE": "South", "FL": "South", "GA": "South", "MD": "South", "NC": "South", "SC": "South", "VA": "South", "DC": "South",
+    "WV": "South", "AL": "South", "KY": "South", "MS": "South", "TN": "South", "AR": "South", "LA": "South", "OK": "South", "TX": "South",
+    "AZ": "West", "CO": "West", "ID": "West", "MT": "West", "NV": "West", "NM": "West", "UT": "West", "WY": "West",
+    "AK": "West", "CA": "West", "HI": "West", "OR": "West", "WA": "West",
+}
+
+
+def _state_from_location_text(text: str) -> str | None:
+    if not text:
+        return None
+    up = str(text).upper()
+    # Try abbreviation after comma first, e.g. "Austin, TX"
+    parts = [p.strip() for p in up.split(",")]
+    for p in reversed(parts):
+        tokens = [t for t in p.replace(".", " ").split() if t]
+        for t in tokens:
+            if t in _US_STATE_ABBRS:
+                return t
+    low = str(text).lower()
+    for name, abbr in _US_STATE_NAME_TO_ABBR.items():
+        if name in low:
+            return abbr
+    return None
+
+
+def _region_from_state(state_abbr: str) -> str | None:
+    s = str(state_abbr or "").strip().upper()
+    return _STATE_TO_REGION.get(s)
+
+
+def _extract_price_and_meta(item: dict, sold_mode: bool) -> tuple[float | None, str, str | None, str | None]:
+    if sold_mode:
+        price_obj = (item.get("sellingStatus") or {}).get("currentPrice") or {}
+        value_raw = price_obj.get("__value__")
+        currency = (price_obj.get("@currencyId") or "").upper()
+        end_time_raw = ((item.get("listingInfo") or {}).get("endTime") or [None])[0]
+        loc_raw = ((item.get("location") or [None])[0]) or ""
+        state = _state_from_location_text(loc_raw)
+        sold_date = str(end_time_raw)[:10] if end_time_raw else None
+    else:
+        price_obj = item.get("price") or {}
+        value_raw = price_obj.get("value")
+        currency = (price_obj.get("currency") or "").upper()
+        loc_obj = item.get("itemLocation") or {}
+        if isinstance(loc_obj, dict):
+            state_raw = loc_obj.get("stateOrProvince") or ""
+            city_raw = loc_obj.get("city") or ""
+            state = _state_from_location_text(f"{city_raw}, {state_raw}")
+        else:
+            state = _state_from_location_text(str(loc_obj))
+        sold_date = None
+    if value_raw is None:
+        return None, currency, sold_date, state
+    try:
+        value = float(value_raw)
+    except Exception:
+        return None, currency, sold_date, state
+    if value <= 0 or value > 100000:
+        return None, currency, sold_date, state
+    return value, currency, sold_date, state
+
+
+def _zip3_from_item(item: dict, sold_mode: bool) -> str | None:
+    try:
+        if sold_mode:
+            return None
+        loc_obj = item.get("itemLocation") or {}
+        postal = ""
+        if isinstance(loc_obj, dict):
+            postal = str(loc_obj.get("postalCode") or "").strip()
+        else:
+            postal = str(loc_obj or "").strip()
+        digits = "".join(ch for ch in postal if ch.isdigit())
+        if len(digits) >= 3:
+            return digits[:3]
+    except Exception:
+        return None
+    return None
+
+
+async def _get_zip3_lookup() -> dict:
+    """
+    Best-effort remote ZIP3 lookup cache.
+    Falls back to empty dict if unavailable.
+    """
+    now = datetime.utcnow()
+    cached = _zip3_lookup_cache.get("data")
+    exp = _zip3_lookup_cache.get("expires_at", datetime.min)
+    if isinstance(cached, dict) and exp > now:
+        return cached
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(ZIP3_LOOKUP_URL)
+        if r.status_code != 200:
+            return cached if isinstance(cached, dict) else {}
+        payload = r.json()
+        if not isinstance(payload, dict):
+            return cached if isinstance(cached, dict) else {}
+        _zip3_lookup_cache["data"] = payload
+        _zip3_lookup_cache["expires_at"] = now + timedelta(hours=12)
+        return payload
+    except Exception:
+        return cached if isinstance(cached, dict) else {}
+
+
+def _state_from_zip3_lookup(zip3: str, lookup: dict) -> str | None:
+    if not zip3 or not isinstance(lookup, dict):
+        return None
+    rec = lookup.get(str(zip3))
+    if not isinstance(rec, dict):
+        return None
+    state = str(rec.get("state") or "").strip().upper()
+    if len(state) == 2 and state.isalpha():
+        return state
+    return None
+
+
+def _region_from_zip3(zip3: str) -> str | None:
+    """
+    Approximate US region from ZIP3's first digit.
+    This is a coarse mapping and should be treated as directional.
+    """
+    z = "".join(ch for ch in str(zip3 or "") if ch.isdigit())
+    if len(z) < 1:
+        return None
+    d = z[0]
+    if d in ("0", "1"):
+        return "Northeast"
+    if d in ("2", "3", "7"):
+        return "South"
+    if d in ("4", "5", "6"):
+        return "Midwest"
+    if d in ("8", "9"):
+        return "West"
+    return None
+
+
+async def _fetch_ebay_items(q: str, limit: int = 1000) -> dict:
+    if not q or not q.strip():
+        return {"warning": "q is required", "mode": "active", "items": [], "soldDebug": {"attempted": False, "ack": None, "errors": [], "itemCount": 0}}
+
+    target_limit = max(20, min(1000, int(limit)))
+    sold_debug = {"attempted": False, "ack": None, "errors": [], "itemCount": 0}
+    items = []
+    sold_mode = False
+
+    finding_url = "https://svcs.ebay.com/services/search/FindingService/v1"
+    try:
+        sold_debug["attempted"] = True
+        per_page = min(100, target_limit)
+        max_pages = max(1, (target_limit + per_page - 1) // per_page)
+        collected = []
+        async with httpx.AsyncClient(timeout=20) as client:
+            for page in range(1, max_pages + 1):
+                finding_params = {
+                    "OPERATION-NAME": "findCompletedItems",
+                    "SERVICE-VERSION": "1.13.0",
+                    "SECURITY-APPNAME": EBAY_CLIENT_ID or "",
+                    "RESPONSE-DATA-FORMAT": "JSON",
+                    "REST-PAYLOAD": "",
+                    "GLOBAL-ID": "EBAY-US",
+                    "keywords": q.strip(),
+                    "paginationInput.entriesPerPage": str(per_page),
+                    "paginationInput.pageNumber": str(page),
+                    "itemFilter(0).name": "SoldItemsOnly",
+                    "itemFilter(0).value": "true",
+                }
+                finding_resp = await client.get(finding_url, params=finding_params)
+                if finding_resp.status_code != 200:
+                    sold_debug["errors"].append(f"http {finding_resp.status_code}")
+                    break
+                fjson = finding_resp.json()
+                root = (fjson.get("findCompletedItemsResponse") or [{}])[0]
+                ack = (root.get("ack") or [""])[0]
+                sold_debug["ack"] = str(ack)
+                errs = (root.get("errorMessage") or [{}])[0].get("error") or []
+                for e in errs:
+                    msg = ((e.get("message") or [""])[0] if isinstance(e.get("message"), list) else "")
+                    if msg:
+                        sold_debug["errors"].append(msg)
+                if str(ack).lower() != "success":
+                    break
+                page_items = ((root.get("searchResult") or [{}])[0].get("item") or [])
+                if not page_items:
+                    break
+                collected.extend(page_items)
+                if len(collected) >= target_limit:
+                    break
+        sold_debug["itemCount"] = len(collected)
+        if collected:
+            items = collected[:target_limit]
+            sold_mode = True
+    except Exception as e:
+        sold_debug["errors"].append(f"sold fetch exception: {type(e).__name__}")
+        items = []
+
+    if not items:
+        try:
+            token = await _get_ebay_token()
+        except Exception as e:
+            return {"warning": f"ebay auth error: {type(e).__name__}", "mode": "active", "items": [], "soldDebug": sold_debug}
+
+        url = f"{_ebay_base_url()}/buy/browse/v1/item_summary/search"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "X-EBAY-C-MARKETPLACE-ID": EBAY_MARKETPLACE,
+            "Accept": "application/json",
+        }
+        per_page = min(200, target_limit)
+        max_pages = max(1, (target_limit + per_page - 1) // per_page)
+        collected = []
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                for page in range(max_pages):
+                    params = {
+                        "q": q.strip(),
+                        "limit": str(per_page),
+                        "offset": str(page * per_page),
+                    }
+                    resp = await client.get(url, params=params, headers=headers)
+                    if resp.status_code != 200:
+                        return {"warning": f"ebay browse error: {resp.status_code}", "mode": "active", "items": collected, "soldDebug": sold_debug}
+                    page_items = (resp.json().get("itemSummaries") or [])
+                    if not page_items:
+                        break
+                    collected.extend(page_items)
+                    if len(collected) >= target_limit:
+                        break
+        except Exception as e:
+            return {"warning": f"ebay request error: {type(e).__name__}", "mode": "active", "items": [], "soldDebug": sold_debug}
+
+        items = collected[:target_limit]
+
+    return {"mode": "sold" if sold_mode else "active", "items": items, "soldDebug": sold_debug}
+
+
+async def _fetch_ebay_pricing(q: str, limit: int = 1000, debug: bool = False) -> dict:
+    if not q or not q.strip():
+        return {"warning": "q is required"}
+
+    fetch = await _fetch_ebay_items(q, limit=limit)
+    items = fetch.get("items") or []
+    sold_mode = fetch.get("mode") == "sold"
+    sold_debug = fetch.get("soldDebug") or {"attempted": False, "ack": None, "errors": [], "itemCount": 0}
+    if fetch.get("warning") and not items:
+        return {"warning": fetch.get("warning"), "sampleSize": 0}
+
+    usd_prices = []
+    all_prices = []
+    currency_counts = {}
+    sold_points_all = []
+    sold_points_usd = []
+
+    for item in items:
+        value, currency, sold_date, _state = _extract_price_and_meta(item, sold_mode)
+        if value is None:
+            continue
+        all_prices.append(value)
+        if currency:
+            currency_counts[currency] = currency_counts.get(currency, 0) + 1
+        if currency == "USD":
+            usd_prices.append(value)
+        if sold_mode and sold_date:
+            pt = {"date": sold_date, "price": value}
+            sold_points_all.append(pt)
+            if currency == "USD":
+                sold_points_usd.append(pt)
+
+    prices = usd_prices if len(usd_prices) >= 3 else all_prices
+    sold_points = sold_points_usd if len(sold_points_usd) >= 3 else sold_points_all
+    prices.sort()
+    sample_size = len(prices)
+    if sample_size < 3:
+        out = {"warning": "insufficient ebay sample", "sampleSize": sample_size}
+        if debug:
+            out["debug"] = {
+                "rawItemCount": len(items),
+                "pricedItemCount": len(all_prices),
+                "usdPricedCount": len(usd_prices),
+                "currencyCounts": currency_counts,
+                "mode": "sold" if sold_mode else "active",
+                "soldDebug": sold_debug,
+            }
+        return out
+
+    low = round(_percentile(prices, 0.25), 2)
+    high = round(_percentile(prices, 0.75), 2)
+    avg = round(sum(prices) / sample_size, 2)
+    currency = "USD" if prices is usd_prices else "MIXED"
+
+    out = {
+        "source": f"eBay {EBAY_ENV} ({'sold' if sold_mode else 'active'})",
+        "sampleSize": sample_size,
+        "currency": currency,
+        "typicalPriceRangeLow": low,
+        "typicalPriceRangeHigh": high,
+        "currentAvgPrice": avg,
+    }
+    if currency == "MIXED":
+        out["warning"] = "using mixed-currency listing prices due low USD sample"
+    if debug:
+        out["debug"] = {
+            "rawItemCount": len(items),
+            "pricedItemCount": len(all_prices),
+            "usdPricedCount": len(usd_prices),
+            "currencyCounts": currency_counts,
+            "mode": "sold" if sold_mode else "active",
+            "soldPoints": len(sold_points),
+            "soldDebug": sold_debug,
+        }
+    if sold_mode and sold_points:
+        out["soldPoints"] = sold_points
+    return out
+
+
+app = FastAPI(title="Market Intel Agent")
+
+# â”€â”€ Serve static files â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+@app.get("/")
+async def root():
+    return FileResponse("static/index.html")
+
+
+# â”€â”€ News API proxy â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+@app.get("/api/news")
+async def get_news(q: str):
+    """Proxy NewsAPI.org /everything endpoint."""
+    if not NEWS_API_KEY:
+        raise HTTPException(status_code=400, detail="Missing NEWS_API_KEY env var")
+
+    # NewsAPI plan limits can be strict/non-inclusive at boundary dates.
+    # Keep a conservative default window and retry with a shorter one if rejected.
+    lookback_days = 29
+    from_date = (datetime.utcnow() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+    base_url = "https://newsapi.org/v2/everything"
+    params = {
+        "q": q,
+        "from": from_date,
+        "sortBy": "publishedAt",
+        "pageSize": "10",
+        "language": "en",
+        "apiKey": NEWS_API_KEY,
+    }
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.get(base_url, params=params)
+        if resp.status_code != 200:
+            try:
+                err0 = resp.json()
+            except Exception:
+                err0 = {"raw": resp.text}
+            msg0 = str((err0 or {}).get("message", ""))
+            # Retry once with a tighter window if provider rejects date range.
+            if "results too far in the past" in msg0.lower() or (err0 or {}).get("code") == "parameterInvalid":
+                params["from"] = (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%d")
+                resp = await client.get(base_url, params=params)
+
+    if resp.status_code != 200:
+        # Show real response body from NewsAPI
+        try:
+            err = resp.json()
+        except Exception:
+            err = {"raw": resp.text}
+        raise HTTPException(status_code=resp.status_code, detail=err)
+
+    data = resp.json()
+    if data.get("status") != "ok":
+        raise HTTPException(status_code=502, detail=data.get("message", data))
+
+    total_results = data.get("totalResults", 0)
+    score = min(100, round(math.log10(total_results + 1) * 38))
+
+    articles = []
+    for a in data.get("articles", []):
+        title = a.get("title")
+        if not title or title == "[Removed]":
+            continue
+        pub = ""
+        if a.get("publishedAt"):
+            try:
+                dt = datetime.fromisoformat(a["publishedAt"].replace("Z", "+00:00"))
+                pub = dt.strftime("%b %d")
+            except Exception:
+                pub = ""
+        articles.append(
+            {
+                "title": title,
+                "source": (a.get("source") or {}).get("name", "Unknown"),
+                "publishedAt": pub,
+                "url": a.get("url", ""),
+            }
+        )
+        if len(articles) >= 6:
+            break
+
+    return {"score": score, "totalResults": total_results, "articles": articles}
+
+
+@app.get("/api/wto/trade")
+async def get_wto_trade(
+    q: str = "",
+    years: int = WTO_DEFAULT_YEARS,
+    reporter_code: str = WTO_REPORTER_CODE,
+    partner_code: str | None = None,
+    hs_code: str | None = None,
+    strict_targeted: bool = True,
+):
+    data = await _fetch_wto_trade_context(
+        years=years,
+        reporter_code=reporter_code,
+        product_query=q,
+        partner_code=partner_code,
+        hs_code=hs_code,
+        strict_targeted=strict_targeted,
+    )
+    return JSONResponse(content=data)
+
+# â”€â”€ Google Trends (pytrends) proxy â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+@app.get("/api/pricing/ebay")
+async def get_ebay_pricing(q: str, debug: bool = False, limit: int = 1000):
+    """
+    Live eBay pricing snapshot from sold/completed data (preferred).
+    Returns robust pricing stats used to refine report pricing.
+    """
+    result = await _fetch_ebay_pricing(q, limit=limit, debug=debug)
+    # Persist snapshots even when this endpoint is called directly (outside /api/analyze).
+    if isinstance(result, dict) and result.get("currentAvgPrice") is not None and result.get("sampleSize", 0) >= 1:
+        pricing = {
+            "currentAvgPrice": result.get("currentAvgPrice"),
+            "typicalPriceRangeLow": result.get("typicalPriceRangeLow"),
+            "typicalPriceRangeHigh": result.get("typicalPriceRangeHigh"),
+            "liveSource": result.get("source", "eBay"),
+            "liveSampleSize": int(result.get("sampleSize", 0)),
+        }
+        _record_price_snapshot(q, pricing)
+        weekly_points = result.get("soldPoints") if isinstance(result.get("soldPoints"), list) else []
+        if not weekly_points and result.get("currentAvgPrice"):
+            weekly_points = [{"date": datetime.utcnow().date().isoformat(), "price": result.get("currentAvgPrice")}]
+        _record_weekly_sold_points(q, weekly_points, str(pricing.get("liveSource", "eBay")))
+    return result
+
+
+@app.get("/api/pricing/map")
+async def get_ebay_price_map(q: str, limit: int = 1000):
+    """
+    Build a state-level eBay price heat map from the same fetched item sample.
+    """
+    if not q or not q.strip():
+        raise HTTPException(status_code=400, detail="q is required")
+
+    fetch = await _fetch_ebay_items(q, limit=limit)
+    items = fetch.get("items") or []
+    sold_mode = fetch.get("mode") == "sold"
+    if fetch.get("warning") and not items:
+        return {"category": q, "source": "eBay", "states": [], "count": 0, "warning": fetch.get("warning")}
+
+    zip3_lookup = await _get_zip3_lookup()
+    by_state = {}
+    by_zip3 = {}
+    approx_state_hits = 0
+    for item in items:
+        value, currency, _sold_date, state = _extract_price_and_meta(item, sold_mode)
+        if value is None or not state:
+            zip3 = _zip3_from_item(item, sold_mode)
+            if value is None or not zip3:
+                continue
+            if currency and currency != "USD":
+                continue
+            lookup_state = _state_from_zip3_lookup(zip3, zip3_lookup)
+            if lookup_state:
+                if lookup_state not in by_state:
+                    by_state[lookup_state] = []
+                by_state[lookup_state].append(float(value))
+                approx_state_hits += 1
+                continue
+            if zip3 not in by_zip3:
+                by_zip3[zip3] = []
+            by_zip3[zip3].append(float(value))
+            continue
+        if currency and currency != "USD":
+            # Keep heat map in a single currency to avoid distortion.
+            continue
+        if state not in by_state:
+            by_state[state] = []
+        by_state[state].append(float(value))
+
+    rows = []
+    granularity = "state"
+    source_buckets = by_state
+    if not source_buckets:
+        granularity = "zip3"
+        source_buckets = by_zip3
+    for loc_key, vals in source_buckets.items():
+        if len(vals) < 2:
+            continue
+        vals_sorted = sorted(vals)
+        rows.append(
+            {
+                "state": loc_key if granularity == "state" else f"ZIP {loc_key}",
+                "avgPrice": round(sum(vals_sorted) / len(vals_sorted), 2),
+                "medianPrice": round(_percentile(vals_sorted, 0.5), 2),
+                "sampleSize": len(vals_sorted),
+                "region": _region_from_state(loc_key) if granularity == "state" else _region_from_zip3(loc_key),
+            }
+        )
+
+    rows.sort(key=lambda x: (x["state"]))
+    source_mode = "sold" if sold_mode else "active"
+    return {
+        "category": q,
+        "source": f"eBay {EBAY_ENV} ({source_mode})",
+        "granularity": granularity,
+        "approximateRegionMapping": granularity == "zip3",
+        "approximateStateFromZip3": approx_state_hits > 0,
+        "states": rows,
+        "count": len(rows),
+    }
+
+
+@app.get("/api/pricing/history")
+async def get_pricing_history(q: str, days: int = 365, granularity: str = "week"):
+    """
+    Stored local pricing history snapshots for a category/query key.
+    """
+    if not q or not q.strip():
+        raise HTTPException(status_code=400, detail="q is required")
+    days = max(30, min(1825, int(days)))
+    g = (granularity or "week").strip().lower()
+    if g == "day":
+        points = _load_recent_snapshots(q, days=days)
+    else:
+        points = _load_recent_weekly_points(q, weeks=max(4, days // 7))
+        g = "week"
+    return {"category": q, "days": days, "granularity": g, "points": points, "count": len(points)}
+
+
+@app.get("/api/trends")
+async def get_trends(q: str, geo: str = "US", days: int = 728):
+    """
+    Live Google Trends interest score (0â€“100) using pytrends.
+    Returns:
+      {
+        "score": 0-100,
+        "timeframe": "YYYY-MM-DD YYYY-MM-DD",
+        "geo": "US",
+        "points": [{"date":"YYYY-MM-DD","value":0-100}, ... over requested window],
+        "warning": optional string
+      }
+
+    Notes:
+    - pytrends is unofficial and can be rate-limited by Google.
+    - Runs in a thread so we don't block the FastAPI event loop.
+    """
+    if not q or not q.strip():
+        raise HTTPException(status_code=400, detail="q is required")
+
+    try:
+        days = int(days)
+    except Exception:
+        raise HTTPException(status_code=400, detail="days must be an integer")
+
+    days = max(7, min(1825, days))
+    end_date = datetime.utcnow().date()
+    start_date = end_date - timedelta(days=days)
+    timeframe = f"{start_date:%Y-%m-%d} {end_date:%Y-%m-%d}"
+    cache_key = f"{q.strip().lower()}|{geo.strip().upper()}|{days}"
+
+    cached = _trends_cache_get(cache_key, _TRENDS_CACHE_TTL_SECONDS)
+    if isinstance(cached, dict):
+        return cached
+
+    def _fetch():
+        # tz in minutes; 300 ~= America/New_York (UTC-5). Good enough for daily series.
+        pytrends = TrendReq(
+            hl="en-US",
+            tz=300,
+            retries=0,
+            backoff_factor=0.0,
+            timeout=(5, 20),
+        )
+
+        fallback_windows = []
+        for d in (days, 365, 180, 90):
+            d = max(7, min(1825, int(d)))
+            if d <= days and d not in fallback_windows:
+                fallback_windows.append(d)
+        if not fallback_windows:
+            fallback_windows = [days]
+
+        last_exc = None
+        for window_days in fallback_windows:
+            window_start = end_date - timedelta(days=window_days)
+            window_timeframe = f"{window_start:%Y-%m-%d} {end_date:%Y-%m-%d}"
+            try:
+                pytrends.build_payload([q], timeframe=window_timeframe, geo=geo)
+                df = pytrends.interest_over_time()
+                if df is None or df.empty or q not in df.columns:
+                    return {
+                        "score": 0,
+                        "timeframe": window_timeframe,
+                        "geo": geo,
+                        "points": [],
+                    }
+
+                s = df[q].astype(float)  # already 0-100 within timeframe
+                last = float(s.iloc[-1])
+                avg7 = float(s.tail(min(7, len(s))).mean())
+                score = int(max(0, min(100, round(0.65 * last + 0.35 * avg7))))
+
+                points = [
+                    {"date": idx.strftime("%Y-%m-%d"), "value": int(val)}
+                    for idx, val in s.tail(window_days).items()
+                ]
+                payload = {
+                    "score": score,
+                    "timeframe": window_timeframe,
+                    "geo": geo,
+                    "points": points,
+                }
+                if window_days != days:
+                    payload["warning"] = (
+                        f"pytrends throttled on {days}d; using {window_days}d fallback"
+                    )
+                return payload
+            except Exception as e:
+                last_exc = e
+                if type(e).__name__ == "TooManyRequestsError":
+                    continue
+                raise
+
+        if last_exc is not None:
+            raise last_exc
+        return {"score": 0, "timeframe": timeframe, "geo": geo, "points": []}
+
+    existing = _trends_inflight.get(cache_key)
+    if existing is not None:
+        return await existing
+
+    async def _fetch_and_cache():
+        try:
+            payload = await to_thread.run_sync(_fetch)
+            _trends_cache_put(cache_key, payload)
+            return payload
+        except Exception as e:
+            stale = _trends_cache_get(cache_key, _TRENDS_CACHE_STALE_MAX_SECONDS)
+            if isinstance(stale, dict):
+                fallback = dict(stale)
+                fallback["warning"] = f"pytrends error: {type(e).__name__}; using cached"
+                return fallback
+            return {
+                "score": 0,
+                "timeframe": timeframe,
+                "geo": geo,
+                "points": [],
+                "warning": f"pytrends error: {type(e).__name__}",
+            }
+
+    task = asyncio.create_task(_fetch_and_cache())
+    _trends_inflight[cache_key] = task
+    try:
+        return await task
+    finally:
+        if _trends_inflight.get(cache_key) is task:
+            _trends_inflight.pop(cache_key, None)
+
+# -- OpenAI Responses API proxy ----------------------------------------------
+def _extract_text_from_responses_api(resp_json: dict) -> str:
+    """
+    Robust extraction for REST Responses API output text.
+    Prefer 'output_text' if present, otherwise traverse 'output' items.
+    """
+    if isinstance(resp_json, dict) and isinstance(resp_json.get("output_text"), str):
+        return resp_json["output_text"]
+
+    output = resp_json.get("output", [])
+    if isinstance(output, list):
+        for item in output:
+            # Typical: {"type":"message","content":[{"type":"output_text","text":"..."}], ...}
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content")
+            if isinstance(content, list):
+                for c in content:
+                    if isinstance(c, dict) and c.get("type") in ("output_text", "text") and isinstance(c.get("text"), str):
+                        return c["text"]
+
+    raise ValueError("Could not extract text from OpenAI response payload")
+
+
+def _clip_0_100(v: float) -> int:
+    return int(max(0, min(100, round(v))))
+
+
+def _weekly_from_trend_points(points: list) -> list:
+    if not isinstance(points, list):
+        return []
+    buckets = {}
+    for p in points:
+        try:
+            ds = str((p or {}).get("date") or "")
+            val = float((p or {}).get("value"))
+            d = datetime.fromisoformat(ds).date()
+        except Exception:
+            continue
+        wk = d - timedelta(days=d.weekday())
+        key = wk.isoformat()
+        if key not in buckets:
+            buckets[key] = []
+        buckets[key].append(val)
+    out = []
+    for k in sorted(buckets.keys()):
+        vals = buckets[k]
+        out.append({"week": k, "value": float(sum(vals) / max(1, len(vals)))})
+    return out
+
+
+def _simple_slope(values: list) -> float:
+    if len(values) < 2:
+        return 0.0
+    return (float(values[-1]) - float(values[0])) / max(1, len(values) - 1)
+
+
+def _arima_future_score(values: list, horizon_weeks: int = 52) -> int | None:
+    """
+    Forecast future Google interest using first-differenced ARIMA workflow:
+    1) difference level series once (d=1),
+    2) fit ARMA on differenced series,
+    3) integrate forecasts back to level space.
+    Returns average forecast level over horizon (0-100) or None on failure.
+    """
+    if not isinstance(values, list) or len(values) < 30:
+        return None
+    try:
+        from statsmodels.tsa.arima.model import ARIMA  # optional dependency
+    except Exception:
+        return None
+
+    try:
+        series = [float(v) for v in values[-260:]]  # use up to 5 years of weekly history
+        if len(series) < 3:
+            return None
+
+        # Explicit first-difference for stationarity.
+        diff_series = [series[i] - series[i - 1] for i in range(1, len(series))]
+        if len(diff_series) < 20:
+            return None
+
+        model = ARIMA(
+            diff_series,
+            order=(1, 0, 1),
+            enforce_stationarity=False,
+            enforce_invertibility=False,
+        )
+        fitted = model.fit()
+        diff_forecast = fitted.forecast(steps=max(4, int(horizon_weeks)))
+        dvals = [float(v) for v in diff_forecast if v is not None and math.isfinite(float(v))]
+        if not dvals:
+            return None
+
+        # Reconstruct level forecast from differenced forecast.
+        last_level = float(series[-1])
+        level_forecast = []
+        running = last_level
+        for dv in dvals:
+            running += dv
+            level_forecast.append(running)
+        if not level_forecast:
+            return None
+
+        avg_fc = sum(level_forecast) / len(level_forecast)
+        return _clip_0_100(avg_fc)
+    except Exception:
+        return None
+
+
+def _timeline_from_google_zscore(trends_payload: dict) -> dict | None:
+    if not isinstance(trends_payload, dict):
+        return None
+    weekly = _weekly_from_trend_points(trends_payload.get("points") or [])
+    if len(weekly) < 30:
+        return None
+
+    vals = [float(w["value"]) for w in weekly]
+    present_vals = vals[-52:] if len(vals) >= 52 else vals[-26:]
+    past_vals = vals[-104:-52] if len(vals) >= 104 else vals[:-len(present_vals)]
+    if not past_vals:
+        past_vals = present_vals
+
+    past_score = _clip_0_100(sum(past_vals) / len(past_vals))
+    present_score = _clip_0_100(sum(present_vals) / len(present_vals))
+
+    recent_for_z = present_vals[-26:] if len(present_vals) >= 26 else present_vals
+    mean_recent = sum(recent_for_z) / len(recent_for_z)
+    var_recent = sum((x - mean_recent) ** 2 for x in recent_for_z) / max(1, len(recent_for_z) - 1)
+    std_recent = math.sqrt(var_recent) if var_recent > 0 else 0.0
+    current = present_vals[-1]
+    z = (current - mean_recent) / std_recent if std_recent > 0 else 0.0
+
+    slope = _simple_slope(present_vals[-8:] if len(present_vals) >= 8 else present_vals)
+    future_raw = present_score + slope * 12 + (z * 4.0)
+    future_score_momentum = _clip_0_100(future_raw)
+    future_score_arima = _arima_future_score(vals, horizon_weeks=52)
+    future_score = future_score_arima if future_score_arima is not None else future_score_momentum
+    method = "google_arima_live" if future_score_arima is not None else "google_zscore_live"
+
+    # Guardrail: if model collapses to zero unexpectedly while present demand exists,
+    # fall back to momentum estimate.
+    if future_score <= 1 and present_score >= 10:
+        future_score = future_score_momentum
+        method = "google_zscore_live"
+
+    def badge_for(delta: float, zscore: float, allow_emerging: bool = False) -> str:
+        if allow_emerging and zscore >= 1.2 and present_score < 45:
+            return "EMERGING"
+        if delta >= 2.0:
+            return "RISING"
+        if delta <= -2.0:
+            return "DECLINING"
+        if zscore >= 1.3 and delta < 0:
+            return "PEAKED"
+        return "STEADY"
+
+    present_badge = badge_for(slope, z, allow_emerging=False)
+    past_delta = present_score - past_score
+    past_badge = "RISING" if past_delta >= 3 else "DECLINING" if past_delta <= -3 else "STEADY"
+    future_delta = future_score - present_score
+    future_badge = badge_for(future_delta / 4.0, z, allow_emerging=True)
+    if future_badge == "STEADY":
+        future_badge = "PEAKED" if z > 1.0 and slope < 0 else "RISING" if future_delta > 0 else "DECLINING" if future_delta < 0 else "PEAKED"
+
+    return {
+        "pastScore": past_score,
+        "presentScore": present_score,
+        "futureScore": future_score,
+        "pastTrendBadge": past_badge,
+        "presentTrendBadge": present_badge,
+        "futureTrendBadge": future_badge,
+        "pastSummary": f"Google Trends baseline over the prior period averaged {past_score}/100.",
+        "presentSummary": f"Recent period averages {present_score}/100 (z-score {z:+.2f}, weekly slope {slope:+.2f}).",
+        "futureSummary": (
+            f"ARIMA projection implies ~{future_score}/100 next period."
+            if method == "google_arima_live"
+            else f"Short-horizon projection from momentum implies ~{future_score}/100 next period."
+        ),
+        "method": method,
+    }
+
+
+def _trend_report_schema():
+    """
+    JSON Schema for Structured Outputs (strict).
+    Keep it aligned with your frontend expectations.
+    """
+    badge_past_present = ["PEAKED", "RISING", "DECLINING", "STEADY"]
+    badge_future = ["PEAKED", "RISING", "DECLINING", "EMERGING"]
+    curve_shapes = ["S-CURVE EARLY", "S-CURVE GROWTH", "S-CURVE PLATEAU", "DECLINING", "CYCLICAL", "VOLATILE"]
+    price_trend = ["RISING", "FALLING", "STABLE", "VOLATILE"]
+    outlook = ["BULLISH", "BEARISH", "NEUTRAL"]
+
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "category",
+            "googleTrendScore",
+            "newsScore",
+            "pastScore",
+            "presentScore",
+            "futureScore",
+            "pastTrendBadge",
+            "presentTrendBadge",
+            "futureTrendBadge",
+            "pastSummary",
+            "presentSummary",
+            "futureSummary",
+            "fullReport",
+            "marketAnalysis",
+            "competitionAnalysis",
+            "politicalAnalysis",
+            "inputBreakdownAnalysis",
+            "hotKeywords",
+            "warmKeywords",
+            "coldKeywords",
+            "trendCurveShape",
+            "leadingBrands",
+            "risingBrands",
+            "topProducts",
+            "fadingProducts",
+            "pricing",
+        ],
+        "properties": {
+            "category": {"type": "string"},
+            "googleTrendScore": {"type": "integer", "minimum": 0, "maximum": 100},
+            "newsScore": {"type": "integer", "minimum": 0, "maximum": 100},
+            "pastScore": {"type": "integer", "minimum": 0, "maximum": 100},
+            "presentScore": {"type": "integer", "minimum": 0, "maximum": 100},
+            "futureScore": {"type": "integer", "minimum": 0, "maximum": 100},
+
+            "pastTrendBadge": {"type": "string", "enum": badge_past_present},
+            "presentTrendBadge": {"type": "string", "enum": badge_past_present},
+            "futureTrendBadge": {"type": "string", "enum": badge_future},
+
+            "pastSummary": {"type": "string"},
+            "presentSummary": {"type": "string"},
+            "futureSummary": {"type": "string"},
+            "fullReport": {"type": "string"},
+            "marketAnalysis": {"type": "string"},
+            "competitionAnalysis": {"type": "string"},
+            "politicalAnalysis": {"type": "string"},
+            "inputBreakdownAnalysis": {"type": "string"},
+
+            "hotKeywords": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+            "warmKeywords": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+            "coldKeywords": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+
+            "trendCurveShape": {"type": "string", "enum": curve_shapes},
+            "leadingBrands": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+            "risingBrands": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+            "topProducts": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+            "fadingProducts": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+
+            "pricing": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": [
+                    "typicalPriceRangeLow",
+                    "typicalPriceRangeHigh",
+                    "currentAvgPrice",
+                    "priceChangeYoY",
+                    "priceTrend",
+                    "priceOutlook",
+                    "forecastAvgPrice12mo",
+                    "forecastAvgPrice24mo",
+                    "monthlyHistory",
+                    "priceBullishDrivers",
+                    "priceBearishDrivers",
+                    "pricingVerdict",
+                ],
+                "properties": {
+                    "typicalPriceRangeLow": {"type": "number"},
+                    "typicalPriceRangeHigh": {"type": "number"},
+                    "currentAvgPrice": {"type": "number"},
+                    "priceChangeYoY": {"type": "number"},
+                    "priceTrend": {"type": "string", "enum": price_trend},
+                    "priceOutlook": {"type": "string", "enum": outlook},
+                    "forecastAvgPrice12mo": {"type": "number"},
+                    "forecastAvgPrice24mo": {"type": "number"},
+                    "monthlyHistory": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["month", "price", "projected"],
+                            "properties": {
+                                "month": {"type": "string"},
+                                "price": {"type": "number"},
+                                "projected": {"type": "boolean"},
+                            },
+                        },
+                        "minItems": 1,
+                    },
+                    "priceBullishDrivers": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                    "priceBearishDrivers": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                    "pricingVerdict": {"type": "string"},
+                },
+            },
+        },
+    }
+
+
+@app.post("/api/analyze")
+async def analyze(request: Request):
+    """
+    Proxy a request to OpenAI Responses API.
+    Accepts:
+      { "category": "...", "apiKey": "optional override", "model": "optional override" }
+    Returns:
+      JSON matching your schema.
+    """
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON body. Use double-quoted JSON keys/values.")
+    category = (body.get("category") or "").strip()
+    wto_partner_code = (body.get("wtoPartnerCode") or "").strip() or None
+    wto_hs_code = (body.get("wtoHsCode") or "").strip() or None
+    wto_strict_targeted = bool(body.get("wtoStrictTargeted", True))
+    if not category:
+        raise HTTPException(status_code=400, detail="category is required")
+
+    api_key = (body.get("apiKey") or "").strip() or OPENAI_API_KEY
+    if not api_key:
+        raise HTTPException(
+            status_code=400,
+            detail="No OpenAI API key. Set OPENAI_API_KEY env var or pass apiKey in body.",
+        )
+
+    model = (body.get("model") or "").strip() or OPENAI_MODEL
+
+    # Collect live signals so the model can reason over the same data used in the report.
+    live_context = {
+        "news": None,
+        "trends": None,
+        "ebayPricing": None,
+        "ebayMap": None,
+        "wtoTrade": None,
+        "storedPricingHistoryWeekly": [],
+        "computedTrendTimeline": None,
+        "computedPricingModel": None,
+        "warnings": [],
+    }
+    try:
+        live_context["news"] = await get_news(category)
+    except Exception as e:
+        live_context["warnings"].append(f"news unavailable: {type(e).__name__}")
+    try:
+        live_context["trends"] = await get_trends(category, geo="US", days=728)
+    except Exception as e:
+        live_context["warnings"].append(f"trends unavailable: {type(e).__name__}")
+    try:
+        live_context["ebayPricing"] = await _fetch_ebay_pricing(category, limit=1000)
+    except Exception as e:
+        live_context["warnings"].append(f"ebay unavailable: {type(e).__name__}")
+    try:
+        live_context["ebayMap"] = await get_ebay_price_map(category, limit=1000)
+    except Exception as e:
+        live_context["warnings"].append(f"ebay map unavailable: {type(e).__name__}")
+    try:
+        live_context["wtoTrade"] = await _fetch_wto_trade_context(
+            years=WTO_DEFAULT_YEARS,
+            reporter_code=WTO_REPORTER_CODE,
+            product_query=category,
+            partner_code=wto_partner_code,
+            hs_code=wto_hs_code,
+            strict_targeted=wto_strict_targeted,
+        )
+    except Exception as e:
+        live_context["warnings"].append(f"wto unavailable: {type(e).__name__}")
+    try:
+        live_context["storedPricingHistoryWeekly"] = _load_recent_weekly_points(category, weeks=104)
+    except Exception as e:
+        live_context["warnings"].append(f"stored pricing history unavailable: {type(e).__name__}")
+
+    trends_live = live_context.get("trends")
+    if (
+        isinstance(trends_live, dict)
+        and isinstance(trends_live.get("score"), (int, float))
+        and isinstance(trends_live.get("points"), list)
+        and len(trends_live.get("points")) > 0
+    ):
+        try:
+            live_context["computedTrendTimeline"] = _timeline_from_google_zscore(trends_live)
+        except Exception as e:
+            live_context["warnings"].append(f"trend timeline model unavailable: {type(e).__name__}")
+
+    ebay_live = live_context.get("ebayPricing")
+    if isinstance(ebay_live, dict) and ebay_live.get("currentAvgPrice") is not None and ebay_live.get("sampleSize", 0) >= 3:
+        try:
+            current = float(ebay_live.get("currentAvgPrice") or 0)
+            low = float(ebay_live.get("typicalPriceRangeLow") or current)
+            high = float(ebay_live.get("typicalPriceRangeHigh") or current)
+            pricing_model = {
+                "currentAvgPrice": current,
+                "typicalPriceRangeLow": low,
+                "typicalPriceRangeHigh": high,
+                "forecastAvgPrice12mo": round(current * 1.04, 2),
+                "forecastAvgPrice24mo": round(current * 1.08, 2),
+                "priceChangeYoY": 0.0,
+                "priceTrend": "STABLE",
+                "priceOutlook": "NEUTRAL",
+                "liveSource": ebay_live.get("source", "eBay"),
+                "liveSampleSize": int(ebay_live.get("sampleSize", 0)),
+            }
+            _reconcile_live_pricing_with_forecast(pricing_model)
+            pricing_model["monthlyHistory"] = _build_expanded_weekly_history(
+                category, pricing_model, hist_weeks=104, proj_weeks=52
+            )
+            live_context["computedPricingModel"] = pricing_model
+        except Exception as e:
+            live_context["warnings"].append(f"pricing model unavailable: {type(e).__name__}")
+
+    current_year = datetime.utcnow().year
+    past_year = current_year - 1
+    future_year = current_year + 1
+
+    # Keep your same “shape” expectations, but let schema enforce correctness.
+    prompt = f"""You are a consumer trend forecasting agent. Analyze "{category}".
+
+Return content that fits the provided JSON schema exactly.
+Be realistic and grounded. If uncertain, choose conservative estimates.
+
+Guidance:
+- Scores are 0–100 integers.
+- Summaries are short (2–3 sentences).
+- marketAnalysis: detailed narrative grounded in trend/news/pricing signals.
+- competitionAnalysis: detailed narrative on competitive positioning and relative demand/price pressure.
+- politicalAnalysis: detailed narrative on policy, regulatory, tariff, labor, or macro-political risks/opportunities.
+- inputBreakdownAnalysis: detailed component/input-cost view of the product (materials, labor, logistics, tariffs, energy, packaging, distribution). Include key drivers and pressure direction.
+- monthlyHistory: include a reasonable mix of historical vs projected entries.
+- Use every available live/computed context section to ground scores and narrative.
+- Explicitly reference specialized tool signals where relevant (NewsAPI, Google Trends, eBay pricing/map, WTO trade context).
+- You may use general model knowledge for context not present in tools, but do not invent specific live facts.
+"""
+
+    payload = {
+        "model": model,
+        "input": [
+            {"role": "system", "content": "You output only valid JSON that matches the provided schema."},
+            {"role": "user", "content": prompt},
+            {
+                "role": "user",
+                "content": "Live context JSON:\n" + json.dumps(live_context, ensure_ascii=True),
+            },
+        ],
+        # Structured Outputs (Responses API uses text.format)
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "trend_report",
+                "strict": True,
+                "schema": _trend_report_schema(),
+            }
+        },
+        # You can tune this up/down
+        "max_output_tokens": 3000,
+        # optional: reduce retention if you want
+        "store": False,
+    }
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+
+    async with httpx.AsyncClient(timeout=90) as client:
+        resp = await client.post(
+            "https://api.openai.com/v1/responses",
+            headers=headers,
+            json=payload,
+        )
+
+    if resp.status_code != 200:
+        detail = resp.text[:800]
+        raise HTTPException(status_code=resp.status_code, detail=f"OpenAI API error: {detail}")
+
+    resp_json = resp.json()
+
+    # With Structured Outputs, this should already be valid JSON text.
+    try:
+        raw_text = _extract_text_from_responses_api(resp_json).strip()
+        parsed = json.loads(raw_text)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Could not parse OpenAI response as JSON: {type(e).__name__}")
+
+    # Inject category/year sanity if you want (optional). Otherwise return as-is.
+    # (Schema already enforces required keys/types.)
+    parsed["category"] = category
+    parsed["marketAnalysis"] = str(parsed.get("marketAnalysis") or parsed.get("fullReport") or "")
+    parsed["competitionAnalysis"] = str(parsed.get("competitionAnalysis") or "")
+    parsed["politicalAnalysis"] = str(parsed.get("politicalAnalysis") or "")
+    parsed["inputBreakdownAnalysis"] = str(parsed.get("inputBreakdownAnalysis") or "")
+
+    # Prefer live eBay pricing for current price/range when available.
+    ebay = live_context.get("ebayPricing")
+    pricing = parsed.get("pricing") or {}
+    if (
+        isinstance(ebay, dict)
+        and ebay.get("currentAvgPrice") is not None
+        and ebay.get("sampleSize", 0) >= 3
+    ):
+        pricing["currentAvgPrice"] = ebay["currentAvgPrice"]
+        pricing["typicalPriceRangeLow"] = ebay["typicalPriceRangeLow"]
+        pricing["typicalPriceRangeHigh"] = ebay["typicalPriceRangeHigh"]
+        pricing["liveSource"] = ebay.get("source", "eBay")
+        pricing["liveSampleSize"] = int(ebay.get("sampleSize", 0))
+        existing_verdict = (pricing.get("pricingVerdict") or "").strip()
+        live_note = f"Live price snapshot from {pricing['liveSource']} ({pricing['liveSampleSize']} comps)."
+        pricing["pricingVerdict"] = f"{existing_verdict} {live_note}".strip()
+    else:
+        pricing["liveSource"] = "AI estimate"
+        if isinstance(ebay, dict) and ebay.get("warning"):
+            pricing["liveWarning"] = ebay["warning"]
+
+    # Apply live news/trends scores when available so returned JSON is aligned.
+    news_live = live_context.get("news")
+    trends_live = live_context.get("trends")
+    if isinstance(news_live, dict) and isinstance(news_live.get("score"), (int, float)):
+        parsed["newsScore"] = int(news_live.get("score"))
+    if (
+        isinstance(trends_live, dict)
+        and isinstance(trends_live.get("score"), (int, float))
+        and isinstance(trends_live.get("points"), list)
+        and len(trends_live.get("points")) > 0
+    ):
+        parsed["googleTrendScore"] = int(trends_live.get("score"))
+        timeline_live = live_context.get("computedTrendTimeline") or _timeline_from_google_zscore(trends_live)
+        if isinstance(timeline_live, dict):
+            parsed["pastScore"] = int(timeline_live["pastScore"])
+            parsed["presentScore"] = int(timeline_live["presentScore"])
+            parsed["futureScore"] = int(timeline_live["futureScore"])
+            parsed["pastTrendBadge"] = str(timeline_live["pastTrendBadge"])
+            parsed["presentTrendBadge"] = str(timeline_live["presentTrendBadge"])
+            parsed["futureTrendBadge"] = str(timeline_live["futureTrendBadge"])
+            parsed["pastSummary"] = str(timeline_live["pastSummary"])
+            parsed["presentSummary"] = str(timeline_live["presentSummary"])
+            parsed["futureSummary"] = str(timeline_live["futureSummary"])
+            parsed["timelineMethod"] = str(timeline_live.get("method") or "google_zscore_live")
+
+    if str(pricing.get("liveSource", "")).lower().startswith("ebay"):
+        _reconcile_live_pricing_with_forecast(pricing)
+    if str(pricing.get("liveSource", "")).lower().startswith("ebay"):
+        weekly_points = []
+        if isinstance(ebay, dict) and isinstance(ebay.get("soldPoints"), list):
+            weekly_points = ebay.get("soldPoints")
+        if not weekly_points and pricing.get("currentAvgPrice"):
+            # Fallback so weekly history still accumulates even if sold comps are unavailable.
+            weekly_points = [{"date": datetime.utcnow().date().isoformat(), "price": pricing.get("currentAvgPrice")}]
+        _record_weekly_sold_points(category, weekly_points, str(pricing.get("liveSource", "eBay")))
+    _normalize_pricing_monthly_history(pricing)
+    _record_price_snapshot(category, pricing)
+    pricing["monthlyHistory"] = _build_expanded_weekly_history(category, pricing, hist_weeks=104, proj_weeks=52)
+    parsed["pricing"] = pricing
+
+    # Optional: if you want the year-specific summaries to match, you can lightly post-process,
+    # but I’m leaving it clean to avoid unexpected mutations.
+
+    return JSONResponse(content=parsed)
+
+
+@app.post("/api/chat_followup")
+async def chat_followup(request: Request):
+    """
+    Follow-up Q&A over the generated report context.
+    Accepts:
+      {
+        "category": "...",
+        "question": "...",
+        "report": {... optional current report json ...},
+        "history": [{"role":"user|assistant","content":"..."}],
+        "apiKey": "optional override",
+        "model": "optional override"
+      }
+    """
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON body. Use double-quoted JSON keys/values.")
+    category = (body.get("category") or "").strip()
+    wto_partner_code = (body.get("wtoPartnerCode") or "").strip() or None
+    wto_hs_code = (body.get("wtoHsCode") or "").strip() or None
+    wto_strict_targeted = bool(body.get("wtoStrictTargeted", True))
+    question = (body.get("question") or "").strip()
+    report = body.get("report")
+    history = body.get("history") if isinstance(body.get("history"), list) else []
+    api_key = (body.get("apiKey") or "").strip() or OPENAI_API_KEY
+    model = (body.get("model") or "").strip() or OPENAI_MODEL
+
+    if not question:
+        raise HTTPException(status_code=400, detail="question is required")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="No OpenAI API key. Set OPENAI_API_KEY or pass apiKey.")
+
+    # Keep history bounded.
+    trimmed_history = []
+    for m in history[-8:]:
+        if not isinstance(m, dict):
+            continue
+        role = str(m.get("role") or "").strip().lower()
+        content = str(m.get("content") or "").strip()
+        if role in ("user", "assistant") and content:
+            trimmed_history.append({"role": role, "content": content[:2000]})
+
+    wto_trade = None
+    try:
+        wto_trade = await _fetch_wto_trade_context(
+            years=WTO_DEFAULT_YEARS,
+            reporter_code=WTO_REPORTER_CODE,
+            product_query=category,
+            partner_code=wto_partner_code,
+            hs_code=wto_hs_code,
+            strict_targeted=wto_strict_targeted,
+        )
+    except Exception:
+        wto_trade = None
+
+    context_payload = {
+        "category": category,
+        "report": report if isinstance(report, dict) else None,
+        "wtoTrade": wto_trade,
+    }
+
+    input_msgs = [
+        {
+            "role": "system",
+            "content": (
+                "You are TrendPulse Follow-up Assistant. "
+                "Use a hybrid approach: prioritize provided report/tool context, and supplement with general model knowledge when needed. "
+                "When WTO trade context is present, use it for tariff/trade-policy portions of the answer. "
+                "Always structure the response with these exact headings: "
+                "'From Report/Tools', 'From General Knowledge', and 'Combined Implication'. "
+                "If a section has no content, write 'None'. "
+                "Do not invent specific live facts that are not in report/tool context."
+            ),
+        },
+        {"role": "user", "content": "Report context JSON:\n" + json.dumps(context_payload, ensure_ascii=True)},
+    ]
+    input_msgs.extend(trimmed_history)
+    input_msgs.append({"role": "user", "content": question})
+
+    payload = {
+        "model": model,
+        "input": input_msgs,
+        "max_output_tokens": 700,
+        "store": False,
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.post("https://api.openai.com/v1/responses", headers=headers, json=payload)
+
+    if resp.status_code != 200:
+        detail = resp.text[:800]
+        raise HTTPException(status_code=resp.status_code, detail=f"OpenAI API error: {detail}")
+
+    try:
+        text = _extract_text_from_responses_api(resp.json()).strip()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Could not parse follow-up response: {type(e).__name__}")
+
+    return {"answer": text}
+
+
