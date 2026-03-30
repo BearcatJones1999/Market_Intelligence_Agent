@@ -186,6 +186,90 @@ function humanizeToolName(name = "") {
     .replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
+function cleanPresentationText(value = "") {
+  return String(value || "")
+    .replace(/\u00a0/g, " ")
+    .replace(/Â/g, "")
+    .replace(/â€™/g, "'")
+    .replace(/â€œ/g, '"')
+    .replace(/â€/g, '"')
+    .replace(/â€”/g, "-")
+    .replace(/â€“/g, "-")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function formatConfidenceLabel(value = "") {
+  const v = cleanPresentationText(value).toLowerCase();
+  if (!v) return "Confidence not recorded";
+  return v.charAt(0).toUpperCase() + v.slice(1) + " confidence";
+}
+
+function summarizeAgentRun(run) {
+  if (!run || typeof run !== "object") return "";
+  const tool = String(run.tool || "");
+  const summary = cleanPresentationText(run.summary || "");
+  if (!summary) return "";
+
+  if (tool === "news") {
+    const score = summary.match(/score=(\d+)/i)?.[1];
+    const total = summary.match(/totalResults=(\d+)/i)?.[1];
+    const titlesBlock = summary.match(/topTitles=\[(.*)\]/i)?.[1] || "";
+    const titles = titlesBlock
+      .split(/',\s*'|",\s*"/)
+      .map((s) => cleanPresentationText(s.replace(/^['"]|['"]$/g, "")))
+      .filter(Boolean)
+      .slice(0, 2);
+    let text = "";
+    if (score) text += `Coverage scored ${score}/100`;
+    if (total) text += `${text ? " from " : ""}${total} recent articles`;
+    if (titles.length) text += `${text ? ". " : ""}Most visible topics: ${titles.join("; ")}.`;
+    return text || summary;
+  }
+
+  if (tool === "trends") {
+    const score = summary.match(/score=(\d+)/i)?.[1];
+    const recentRaw = summary.match(/recentPoints=\[(.*)\]/i)?.[1] || "";
+    const values = Array.from(recentRaw.matchAll(/value['"]?:\s*(\d+)/g)).map((m) => Number(m[1]));
+    const latest = values.length ? values[values.length - 1] : null;
+    const prev = values.length > 1 ? values[values.length - 2] : null;
+    const trendText =
+      latest != null && prev != null
+        ? latest > prev
+          ? "Momentum is still rising."
+          : latest < prev
+          ? "Momentum cooled slightly in the latest reading."
+          : "Momentum held steady in the latest reading."
+        : "";
+    return `${score ? `Search interest scored ${score}/100.` : ""} ${trendText}`.trim() || summary;
+  }
+
+  if (tool === "ebay_pricing") {
+    const avg = summary.match(/avg=([\d.]+)/i)?.[1];
+    const low = summary.match(/range=\(([\d.]+),/i)?.[1];
+    const high = summary.match(/range=\([\d.]+,\s*([\d.]+)\)/i)?.[1];
+    const sample = summary.match(/sample=(\d+)/i)?.[1];
+    return `Observed market pricing averaged $${avg || "n/a"}${low && high ? ` with a typical range of $${low}-$${high}` : ""}${sample ? ` across ${sample} listings` : ""}.`;
+  }
+
+  if (tool === "pricing_history") {
+    const count = summary.match(/weeklyPoints=(\d+)/i)?.[1];
+    return `${count ? `${count} recent weekly pricing observations were available` : "Recent pricing history was available"} to check continuity and direction over time.`;
+  }
+
+  if (tool === "wto_trade") {
+    const headline = summary.match(/headline=([^[]*?)(?:warnings=|$)/i)?.[1];
+    return cleanPresentationText(headline || summary);
+  }
+
+  if (tool === "ebay_map") {
+    const count = summary.match(/count=(\d+)/i)?.[1];
+    return `${count ? `${count} regional pricing clusters were mapped` : "Regional pricing patterns were mapped"} to identify geographic variation.`;
+  }
+
+  return summary;
+}
+
 function renderAgentTraceCard(agentTrace) {
   if (!agentTrace || typeof agentTrace !== "object") return "";
   const toolPlan = Array.isArray(agentTrace.toolPlan) ? agentTrace.toolPlan : [];
@@ -196,17 +280,22 @@ function renderAgentTraceCard(agentTrace) {
 
   return `<div class="section-card agent-card" style="margin-bottom:20px">
     <div class="section-heading">Agent Workflow <span class="live-badge" style="font-size:9px">plan-act-observe</span></div>
+    <div class="agent-steps">
+      <span class="agent-step">1. Planned</span>
+      <span class="agent-step">2. Gathered Evidence</span>
+      <span class="agent-step">3. Reflected</span>
+    </div>
     <div class="agent-grid">
       <div class="agent-panel">
         <div class="agent-label">Objective</div>
-        <div class="agent-text">${esc(agentTrace.objective || "No objective recorded.")}</div>
+        <div class="agent-text">${esc(cleanPresentationText(agentTrace.objective || "No objective recorded."))}</div>
       </div>
       <div class="agent-panel">
-        <div class="agent-label">Planner Reasoning</div>
-        <div class="agent-text">${esc(agentTrace.planReasoning || "No planner notes recorded.")}</div>
+        <div class="agent-label">Why These Tools</div>
+        <div class="agent-text">${esc(cleanPresentationText(agentTrace.planReasoning || "No planner notes recorded."))}</div>
       </div>
       <div class="agent-panel">
-        <div class="agent-label">Primary Tools</div>
+        <div class="agent-label">Selected Tools</div>
         <div class="agent-chip-row">${
           toolPlan.length
             ? toolPlan.map((tool) => `<span class="agent-chip">${esc(humanizeToolName(tool))}</span>`).join("")
@@ -214,35 +303,35 @@ function renderAgentTraceCard(agentTrace) {
         }</div>
       </div>
       <div class="agent-panel">
-        <div class="agent-label">Reflection</div>
-        <div class="agent-text">Confidence: ${esc(reflection.confidence || "n/a")}</div>
-        <div class="agent-sub">${esc(reflection.stopReason || "No reflection summary recorded.")}</div>
+        <div class="agent-label">Decision Summary</div>
+        <div class="agent-text">${esc(formatConfidenceLabel(reflection.confidence || ""))}</div>
+        <div class="agent-sub">${esc(cleanPresentationText(reflection.stopReason || "No reflection summary recorded."))}</div>
         ${
           additionalTools.length
-            ? `<div class="agent-sub" style="margin-top:8px">Second pass: ${esc(
+            ? `<div class="agent-sub" style="margin-top:8px">Additional evidence gathered: ${esc(
                 additionalTools.map(humanizeToolName).join(", ")
               )}</div>`
-            : `<div class="agent-sub" style="margin-top:8px">Second pass: none needed</div>`
+            : `<div class="agent-sub" style="margin-top:8px">Additional evidence gathered: none needed</div>`
         }
       </div>
     </div>
     ${
       agentTrace.clarificationRequested && agentTrace.clarifyingQuestion
-        ? `<div class="agent-note">Clarification the agent considered asking: ${esc(agentTrace.clarifyingQuestion)}</div>`
+        ? `<div class="agent-note">Clarification considered: ${esc(cleanPresentationText(agentTrace.clarifyingQuestion))}</div>`
         : ""
     }
     ${
       toolRuns.length
-        ? `<div class="agent-runs">${toolRuns
+        ? `<div class="agent-runs-label">Evidence Collected</div><div class="agent-runs">${toolRuns
             .map(
               (run) => `<div class="agent-run">
                 <div class="agent-run-head">
                   <span class="agent-run-name">${esc(humanizeToolName(run.tool || ""))}</span>
                   <span class="agent-run-status ${run.status === "error" ? "error" : "ok"}">${esc(
-                    run.status || "ok"
+                    run.status === "error" ? "issue" : "used"
                   )}</span>
                 </div>
-                <div class="agent-run-summary">${esc(run.summary || "")}</div>
+                <div class="agent-run-summary">${esc(summarizeAgentRun(run))}</div>
               </div>`
             )
             .join("")}</div>`
@@ -261,12 +350,12 @@ function renderAgentTraceMini(agentTrace) {
   const toolPlan = Array.isArray(agentTrace.toolPlan) ? agentTrace.toolPlan : [];
   const additionalTools = Array.isArray(agentTrace.additionalTools) ? agentTrace.additionalTools : [];
   return `<div class="followup-trace">
-    <div class="followup-trace-title">Agent trace</div>
-    <div class="followup-trace-text">${esc(agentTrace.objective || "Follow-up evidence gathering")}</div>
+    <div class="followup-trace-title">Workflow summary</div>
+    <div class="followup-trace-text">${esc(cleanPresentationText(agentTrace.objective || "Follow-up evidence gathering"))}</div>
     <div class="followup-trace-text">Tools: ${esc(
       toolPlan.length ? toolPlan.map(humanizeToolName).join(", ") : "none recorded"
     )}</div>
-    <div class="followup-trace-text">Second pass: ${esc(
+    <div class="followup-trace-text">Additional evidence: ${esc(
       additionalTools.length ? additionalTools.map(humanizeToolName).join(", ") : "none"
     )}</div>
   </div>`;
@@ -1362,6 +1451,74 @@ function buildReportHTML(r, n, t, w) {
         )
         .join("")}</div>`
     : "";
+  const agentTrace = r?.agentTrace && typeof r.agentTrace === "object" ? r.agentTrace : null;
+  const toolPlan = Array.isArray(agentTrace?.toolPlan) ? agentTrace.toolPlan : [];
+  const additionalTools = Array.isArray(agentTrace?.additionalTools) ? agentTrace.additionalTools : [];
+  const toolRuns = Array.isArray(agentTrace?.toolRuns) ? agentTrace.toolRuns : [];
+  const agentWarnings = Array.isArray(agentTrace?.warnings) ? agentTrace.warnings : [];
+  const reflection = agentTrace?.reflection || {};
+  const agentTraceHTML = agentTrace
+    ? `<div class="sec-title">Agent Workflow <span class="badge-pill live" style="font-size:8px">plan-act-observe</span></div>
+  <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
+    <span class="chip sub">1. Planned</span>
+    <span class="chip sub">2. Gathered Evidence</span>
+    <span class="chip sub">3. Reflected</span>
+  </div>
+  <div class="grid-2" style="margin-bottom:10px">
+    <div class="stat" style="border-color:#99f6e4;background:#fcfffd">
+      <div class="stat-lbl" style="color:#0d9488">Objective</div>
+      <div class="report-body" style="font-size:11px">${esc(cleanPresentationText(agentTrace.objective || "No objective recorded."))}</div>
+    </div>
+    <div class="stat" style="border-color:#99f6e4;background:#fcfffd">
+      <div class="stat-lbl" style="color:#0d9488">Why These Tools</div>
+      <div class="report-body" style="font-size:11px">${esc(cleanPresentationText(agentTrace.planReasoning || "No planner notes recorded."))}</div>
+    </div>
+  </div>
+  <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#8c897e;margin:8px 0 6px">Selected Tools</div>
+  <div class="chip-group" style="margin-bottom:10px">${
+    toolPlan.length
+      ? toolPlan.map((tool) => `<span class="chip sub">${esc(humanizeToolName(tool))}</span>`).join("")
+      : `<span style="font-size:10px;color:#8c897e">No tools recorded.</span>`
+  }</div>
+  <div class="grid-2" style="margin-bottom:10px">
+    <div class="stat">
+      <div class="stat-lbl">Decision Summary</div>
+      <div class="stat-sub">${esc(formatConfidenceLabel(reflection.confidence || ""))}</div>
+      <div class="report-body" style="font-size:11px">${esc(cleanPresentationText(reflection.stopReason || "No reflection summary recorded."))}</div>
+      <div class="stat-sub" style="margin-top:8px">Additional evidence gathered: ${esc(
+        additionalTools.length ? additionalTools.map(humanizeToolName).join(", ") : "none needed"
+      )}</div>
+    </div>
+    <div class="stat">
+      <div class="stat-lbl">Clarification Check</div>
+      <div class="report-body" style="font-size:11px">${esc(
+        agentTrace.clarificationRequested && agentTrace.clarifyingQuestion
+          ? `The agent considered asking: ${cleanPresentationText(agentTrace.clarifyingQuestion)}`
+          : "No clarification was needed before analysis."
+      )}</div>
+    </div>
+  </div>
+  ${
+    toolRuns.length
+      ? `<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#8c897e;margin:8px 0 6px">Evidence Collected</div>
+  <div class="grid-2">${toolRuns
+    .map(
+      (run) => `<div class="stat${run.status === "error" ? "" : " live"}">
+      <div class="stat-lbl">${esc(humanizeToolName(run.tool || ""))} <span class="badge-pill ${
+        run.status === "error" ? "ai" : "live"
+      }">${esc(run.status === "error" ? "issue" : "used")}</span></div>
+      <div class="report-body" style="font-size:11px">${esc(summarizeAgentRun(run))}</div>
+    </div>`
+    )
+    .join("")}</div>`
+      : ""
+  }
+  ${
+    agentWarnings.length
+      ? `<div class="disclaimer" style="margin-top:10px">Warnings: ${esc(agentWarnings.join(" | "))}</div>`
+      : ""
+  }`
+    : "";
   const followupHTML = Array.isArray(followupMessages) && followupMessages.length
     ? `<div class="sec-title">Follow-up Conversation <span class="badge-pill ai" style="font-size:8px">ChatGPT</span></div>
   <div style="margin-bottom:10px">${followupMessages
@@ -1369,6 +1526,19 @@ function buildReportHTML(r, n, t, w) {
         (m) => `<div style="border:1px solid #e4e1d8;border-radius:7px;padding:10px 12px;background:${m.role === "assistant" ? "#f0fdfa" : "#eff4ff"};margin-bottom:8px">
       <div style="font-size:9px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;color:#8c897e;margin-bottom:4px">${m.role === "assistant" ? "Assistant" : "You"}</div>
       <div style="font-size:12px;line-height:1.65;color:#4a4740;white-space:pre-wrap">${esc(m.content || "")}</div>
+      ${
+        m.role === "assistant" && m.agentTrace
+          ? `<div style="margin-top:8px;padding-top:8px;border-top:1px dashed #99f6e4">
+        <div style="font-size:9px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;color:#0d9488;margin-bottom:4px">Workflow summary</div>
+        <div style="font-size:10px;color:#4a4740;line-height:1.55">${esc(cleanPresentationText(m.agentTrace.objective || "Follow-up evidence gathering"))}</div>
+        <div style="font-size:10px;color:#8c897e;line-height:1.55;margin-top:4px">Tools: ${esc(
+          Array.isArray(m.agentTrace.toolPlan) && m.agentTrace.toolPlan.length
+            ? m.agentTrace.toolPlan.map(humanizeToolName).join(", ")
+            : "none recorded"
+        )}</div>
+      </div>`
+          : ""
+      }
     </div>`
       )
       .join("")}</div>`
@@ -1441,6 +1611,8 @@ function buildReportHTML(r, n, t, w) {
     <span style="display:flex;align-items:center;gap:4px"><span style="width:8px;height:8px;border-radius:50%;background:#0d9488;display:inline-block"></span> Live data (NewsAPI${googleIsLive ? " + Google Trends" : ""}${pricingIsLive ? " + eBay" : ""}${wtoIsLive ? " + WTO" : ""})</span>
     <span style="display:flex;align-items:center;gap:4px"><span style="width:8px;height:8px;border-radius:50%;background:#7c3aed;display:inline-block"></span> AI estimate (OpenAI)</span>
   </div>
+
+  ${agentTraceHTML}
 
   <div class="sec-title">Signal Scores</div>
   <div class="grid-4">
