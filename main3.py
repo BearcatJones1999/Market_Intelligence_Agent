@@ -1867,6 +1867,403 @@ def _extract_text_from_responses_api(resp_json: dict) -> str:
     raise ValueError("Could not extract text from OpenAI response payload")
 
 
+async def _openai_structured_json(
+    api_key: str,
+    model: str,
+    system_prompt: str,
+    user_messages: list[str],
+    schema_name: str,
+    schema: dict,
+    max_output_tokens: int = 700,
+) -> dict | None:
+    payload = {
+        "model": model,
+        "input": [{"role": "system", "content": system_prompt}],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": schema_name,
+                "strict": True,
+                "schema": schema,
+            }
+        },
+        "max_output_tokens": max_output_tokens,
+        "store": False,
+    }
+    for msg in user_messages:
+        payload["input"].append({"role": "user", "content": msg})
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=45) as client:
+            resp = await client.post("https://api.openai.com/v1/responses", headers=headers, json=payload)
+        if resp.status_code != 200:
+            return None
+        text = _extract_text_from_responses_api(resp.json()).strip()
+        return json.loads(text) if text else None
+    except Exception:
+        return None
+
+
+def _market_tool_specs() -> dict:
+    return {
+        "news": {
+            "description": "Recent market/news coverage. Best for demand catalysts, launches, sentiment, and retail narratives.",
+            "live_context_key": "news",
+        },
+        "trends": {
+            "description": "Google Trends demand signal over time. Best for consumer interest, seasonality, and momentum.",
+            "live_context_key": "trends",
+        },
+        "ebay_pricing": {
+            "description": "Live eBay pricing snapshot. Best for current resale price bands and market-clearing price direction.",
+            "live_context_key": "ebayPricing",
+        },
+        "ebay_map": {
+            "description": "Regional eBay pricing map. Best for geographic price dispersion and regional demand pockets.",
+            "live_context_key": "ebayMap",
+        },
+        "wto_trade": {
+            "description": "WTO trade context. Best for import exposure, partner concentration, tariff sensitivity, and trade-policy risk.",
+            "live_context_key": "wtoTrade",
+        },
+        "pricing_history": {
+            "description": "Stored local weekly pricing history. Best for historical price trend continuity and reconciliation with live snapshots.",
+            "live_context_key": "storedPricingHistoryWeekly",
+        },
+    }
+
+
+def _market_tool_plan_schema(max_tools: int = 4) -> dict:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["objective", "selectedTools", "reasoning", "needsClarification", "clarifyingQuestion"],
+        "properties": {
+            "objective": {"type": "string"},
+            "selectedTools": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": max_tools,
+                "items": {"type": "string"},
+            },
+            "reasoning": {"type": "string"},
+            "needsClarification": {"type": "boolean"},
+            "clarifyingQuestion": {"type": "string"},
+        },
+    }
+
+
+def _market_tool_reflection_schema(max_tools: int = 2) -> dict:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["confidence", "stopReason", "additionalTools", "missingInformation"],
+        "properties": {
+            "confidence": {"type": "string"},
+            "stopReason": {"type": "string"},
+            "additionalTools": {
+                "type": "array",
+                "minItems": 0,
+                "maxItems": max_tools,
+                "items": {"type": "string"},
+            },
+            "missingInformation": {"type": "string"},
+        },
+    }
+
+
+def _sanitize_tool_selection(selected_tools: list, max_tools: int = 4) -> list[str]:
+    allowed = _market_tool_specs().keys()
+    out = []
+    for tool_name in selected_tools or []:
+        name = str(tool_name or "").strip()
+        if name in allowed and name not in out:
+            out.append(name)
+    return out[:max_tools]
+
+
+async def _run_market_tool(
+    tool_name: str,
+    category: str,
+    *,
+    wto_partner_code: str | None = None,
+    wto_hs_code: str | None = None,
+    wto_strict_targeted: bool = True,
+) -> tuple[str, object, str | None]:
+    try:
+        if tool_name == "news":
+            return tool_name, await get_news(category), None
+        if tool_name == "trends":
+            return tool_name, await get_trends(category, geo="US", days=728), None
+        if tool_name == "ebay_pricing":
+            return tool_name, await _fetch_ebay_pricing(category, limit=1000), None
+        if tool_name == "ebay_map":
+            return tool_name, await get_ebay_price_map(category, limit=1000), None
+        if tool_name == "wto_trade":
+            return tool_name, await _fetch_wto_trade_context(
+                years=WTO_DEFAULT_YEARS,
+                reporter_code=WTO_REPORTER_CODE,
+                product_query=category,
+                partner_code=wto_partner_code,
+                hs_code=wto_hs_code,
+                strict_targeted=wto_strict_targeted,
+            ), None
+        if tool_name == "pricing_history":
+            return tool_name, _load_recent_weekly_points(category, weeks=104), None
+        return tool_name, None, "unknown tool"
+    except Exception as e:
+        return tool_name, None, type(e).__name__
+
+
+def _summarize_tool_result_for_agent(tool_name: str, result: object, error: str | None = None) -> dict:
+    if error:
+        return {"tool": tool_name, "status": "error", "summary": error}
+    if tool_name == "news" and isinstance(result, dict):
+        articles = result.get("articles") or []
+        titles = [str((a or {}).get("title") or "") for a in articles[:3] if (a or {}).get("title")]
+        return {
+            "tool": tool_name,
+            "status": "ok",
+            "summary": f"score={result.get('score')} totalResults={result.get('totalResults')} topTitles={titles}",
+        }
+    if tool_name == "trends" and isinstance(result, dict):
+        pts = result.get("points") or []
+        tail = pts[-4:] if isinstance(pts, list) else []
+        return {
+            "tool": tool_name,
+            "status": "ok",
+            "summary": f"score={result.get('score')} timeframe={result.get('timeframe')} recentPoints={tail}",
+        }
+    if tool_name == "ebay_pricing" and isinstance(result, dict):
+        return {
+            "tool": tool_name,
+            "status": "ok",
+            "summary": (
+                f"avg={result.get('currentAvgPrice')} range=({result.get('typicalPriceRangeLow')}, "
+                f"{result.get('typicalPriceRangeHigh')}) sample={result.get('sampleSize')} "
+                f"source={result.get('source')}"
+            ),
+        }
+    if tool_name == "ebay_map" and isinstance(result, dict):
+        states = result.get("states") or []
+        return {
+            "tool": tool_name,
+            "status": "ok",
+            "summary": f"granularity={result.get('granularity')} count={result.get('count')} sampleRows={states[:3]}",
+        }
+    if tool_name == "wto_trade" and isinstance(result, dict):
+        return {
+            "tool": tool_name,
+            "status": "ok",
+            "summary": (
+                f"partners={result.get('partnerCandidates')} hs={result.get('hsCandidates')} "
+                f"headline={result.get('headline')} warnings={result.get('warnings')}"
+            ),
+        }
+    if tool_name == "pricing_history" and isinstance(result, list):
+        return {
+            "tool": tool_name,
+            "status": "ok",
+            "summary": f"weeklyPoints={len(result)} latest={result[-3:] if result else []}",
+        }
+    return {"tool": tool_name, "status": "ok", "summary": str(result)[:500]}
+
+
+async def _build_agentic_live_context(
+    category: str,
+    *,
+    api_key: str,
+    model: str,
+    wto_partner_code: str | None = None,
+    wto_hs_code: str | None = None,
+    wto_strict_targeted: bool = True,
+    user_objective: str | None = None,
+) -> tuple[dict, dict]:
+    live_context = {
+        "news": None,
+        "trends": None,
+        "ebayPricing": None,
+        "ebayMap": None,
+        "wtoTrade": None,
+        "storedPricingHistoryWeekly": [],
+        "computedTrendTimeline": None,
+        "computedPricingModel": None,
+        "warnings": [],
+    }
+    tool_specs = _market_tool_specs()
+    default_tools = ["trends", "news", "ebay_pricing", "wto_trade"]
+    planner_prompt = (
+        "You are planning evidence gathering for a market intelligence agent. "
+        "Select only the tools needed to answer well. Prefer 2-4 tools, not all tools by default. "
+        "Only request clarification when ambiguity would materially change the evidence needed."
+    )
+    planner_input = [
+        f"Category: {category}",
+        "Available tools JSON:\n" + json.dumps(
+            [{"name": name, "description": spec["description"]} for name, spec in tool_specs.items()],
+            ensure_ascii=True,
+        ),
+    ]
+    if user_objective:
+        planner_input.append("User objective:\n" + str(user_objective))
+    if wto_partner_code or wto_hs_code:
+        planner_input.append(
+            "Known WTO targeting:\n"
+            + json.dumps(
+                {
+                    "partner_code": wto_partner_code,
+                    "hs_code": wto_hs_code,
+                    "strict_targeted": bool(wto_strict_targeted),
+                },
+                ensure_ascii=True,
+            )
+        )
+    plan = await _openai_structured_json(
+        api_key=api_key,
+        model=model,
+        system_prompt=planner_prompt,
+        user_messages=planner_input,
+        schema_name="market_tool_plan",
+        schema=_market_tool_plan_schema(),
+        max_output_tokens=350,
+    )
+    selected_tools = _sanitize_tool_selection((plan or {}).get("selectedTools") or [], max_tools=4)
+    if not selected_tools:
+        selected_tools = default_tools
+
+    first_pass_results = await asyncio.gather(
+        *[
+            _run_market_tool(
+                tool_name,
+                category,
+                wto_partner_code=wto_partner_code,
+                wto_hs_code=wto_hs_code,
+                wto_strict_targeted=wto_strict_targeted,
+            )
+            for tool_name in selected_tools
+        ]
+    )
+
+    tool_runs = []
+    for tool_name, result, error in first_pass_results:
+        spec = tool_specs.get(tool_name) or {}
+        live_key = spec.get("live_context_key")
+        if live_key:
+            live_context[live_key] = result if error is None else live_context.get(live_key)
+        if error:
+            live_context["warnings"].append(f"{tool_name} unavailable: {error}")
+        tool_runs.append(_summarize_tool_result_for_agent(tool_name, result, error))
+
+    reflection = await _openai_structured_json(
+        api_key=api_key,
+        model=model,
+        system_prompt=(
+            "You are reviewing evidence gathered by a market intelligence agent. "
+            "If the evidence is still weak, request up to 2 additional tools not yet used. "
+            "Do not ask for more tools if current evidence is already sufficient."
+        ),
+        user_messages=[
+            f"Category: {category}",
+            "Already used tools:\n" + json.dumps(selected_tools, ensure_ascii=True),
+            "Tool summaries JSON:\n" + json.dumps(tool_runs, ensure_ascii=True),
+            "Available tools JSON:\n"
+            + json.dumps(
+                [{"name": name, "description": spec["description"]} for name, spec in tool_specs.items()],
+                ensure_ascii=True,
+            ),
+        ],
+        schema_name="market_tool_reflection",
+        schema=_market_tool_reflection_schema(),
+        max_output_tokens=260,
+    )
+
+    extra_tools = [
+        name for name in _sanitize_tool_selection((reflection or {}).get("additionalTools") or [], max_tools=2)
+        if name not in selected_tools
+    ]
+    if extra_tools:
+        second_pass_results = await asyncio.gather(
+            *[
+                _run_market_tool(
+                    tool_name,
+                    category,
+                    wto_partner_code=wto_partner_code,
+                    wto_hs_code=wto_hs_code,
+                    wto_strict_targeted=wto_strict_targeted,
+                )
+                for tool_name in extra_tools
+            ]
+        )
+        for tool_name, result, error in second_pass_results:
+            spec = tool_specs.get(tool_name) or {}
+            live_key = spec.get("live_context_key")
+            if live_key:
+                live_context[live_key] = result if error is None else live_context.get(live_key)
+            if error:
+                live_context["warnings"].append(f"{tool_name} unavailable: {error}")
+            tool_runs.append(_summarize_tool_result_for_agent(tool_name, result, error))
+
+    trends_live = live_context.get("trends")
+    if (
+        isinstance(trends_live, dict)
+        and isinstance(trends_live.get("score"), (int, float))
+        and isinstance(trends_live.get("points"), list)
+        and len(trends_live.get("points")) > 0
+    ):
+        try:
+            live_context["computedTrendTimeline"] = _timeline_from_google_zscore(trends_live)
+        except Exception as e:
+            live_context["warnings"].append(f"trend timeline model unavailable: {type(e).__name__}")
+
+    ebay_live = live_context.get("ebayPricing")
+    if isinstance(ebay_live, dict) and ebay_live.get("currentAvgPrice") is not None and ebay_live.get("sampleSize", 0) >= 3:
+        try:
+            current = float(ebay_live.get("currentAvgPrice") or 0)
+            low = float(ebay_live.get("typicalPriceRangeLow") or current)
+            high = float(ebay_live.get("typicalPriceRangeHigh") or current)
+            pricing_model = {
+                "currentAvgPrice": current,
+                "typicalPriceRangeLow": low,
+                "typicalPriceRangeHigh": high,
+                "forecastAvgPrice12mo": round(current * 1.04, 2),
+                "forecastAvgPrice24mo": round(current * 1.08, 2),
+                "priceChangeYoY": 0.0,
+                "priceTrend": "STABLE",
+                "priceOutlook": "NEUTRAL",
+                "liveSource": ebay_live.get("source", "eBay"),
+                "liveSampleSize": int(ebay_live.get("sampleSize", 0)),
+            }
+            _reconcile_live_pricing_with_forecast(pricing_model)
+            pricing_model["monthlyHistory"] = _build_expanded_weekly_history(
+                category, pricing_model, hist_weeks=104, proj_weeks=52
+            )
+            live_context["computedPricingModel"] = pricing_model
+        except Exception as e:
+            live_context["warnings"].append(f"pricing model unavailable: {type(e).__name__}")
+
+    agent_trace = {
+        "mode": "plan-act-observe",
+        "objective": (plan or {}).get("objective") or (user_objective or f"Analyze market conditions for {category}"),
+        "planReasoning": (plan or {}).get("reasoning") or "Planner unavailable; used fallback tool bundle.",
+        "clarificationRequested": bool((plan or {}).get("needsClarification")),
+        "clarifyingQuestion": (plan or {}).get("clarifyingQuestion") or "",
+        "toolPlan": selected_tools,
+        "additionalTools": extra_tools,
+        "toolRuns": tool_runs,
+        "reflection": reflection or {
+            "confidence": "medium",
+            "stopReason": "Reflection unavailable; proceeded with gathered evidence.",
+            "additionalTools": [],
+            "missingInformation": "",
+        },
+        "warnings": list(live_context.get("warnings") or []),
+    }
+    return live_context, agent_trace
+
+
 def _clip_0_100(v: float) -> int:
     return int(max(0, min(100, round(v))))
 
@@ -1900,55 +2297,155 @@ def _simple_slope(values: list) -> float:
     return (float(values[-1]) - float(values[0])) / max(1, len(values) - 1)
 
 
-def _arima_future_score(values: list, horizon_weeks: int = 52) -> int | None:
+def _arima_robustness(values: list, horizon_weeks: int = 52) -> dict | None:
     """
-    Forecast future Google interest using first-differenced ARIMA workflow:
-    1) difference level series once (d=1),
-    2) fit ARMA on differenced series,
-    3) integrate forecasts back to level space.
-    Returns average forecast level over horizon (0-100) or None on failure.
+    Forecast future Google interest and return compact robustness evidence:
+    - model specification
+    - in-sample diagnostics
+    - holdout validation vs simple baselines
     """
     if not isinstance(values, list) or len(values) < 30:
         return None
     try:
         from statsmodels.tsa.arima.model import ARIMA  # optional dependency
+        from statsmodels.tsa.stattools import adfuller
+        from statsmodels.stats.diagnostic import acorr_ljungbox
     except Exception:
         return None
 
+    def _clean(vals: list) -> list[float]:
+        out = []
+        for v in vals[-260:]:
+            try:
+                fv = float(v)
+            except Exception:
+                continue
+            if math.isfinite(fv):
+                out.append(fv)
+        return out
+
+    def _rmse(actual: list[float], pred: list[float]) -> float:
+        if not actual or len(actual) != len(pred):
+            return 0.0
+        return math.sqrt(sum((a - b) ** 2 for a, b in zip(actual, pred)) / len(actual))
+
+    def _mae(actual: list[float], pred: list[float]) -> float:
+        if not actual or len(actual) != len(pred):
+            return 0.0
+        return sum(abs(a - b) for a, b in zip(actual, pred)) / len(actual)
+
     try:
-        series = [float(v) for v in values[-260:]]  # use up to 5 years of weekly history
-        if len(series) < 3:
+        series = _clean(values)
+        if len(series) < 40:
             return None
 
-        # Explicit first-difference for stationarity.
-        diff_series = [series[i] - series[i - 1] for i in range(1, len(series))]
-        if len(diff_series) < 20:
+        holdout_weeks = min(12, max(8, len(series) // 12))
+        if len(series) <= holdout_weeks + 20:
+            holdout_weeks = max(4, min(8, len(series) // 5))
+        train_series = series[:-holdout_weeks]
+        test_series = series[-holdout_weeks:]
+        if len(train_series) < 24 or len(test_series) < 4:
             return None
 
-        model = ARIMA(
-            diff_series,
+        diff_train = [train_series[i] - train_series[i - 1] for i in range(1, len(train_series))]
+        if len(diff_train) < 20:
+            return None
+
+        # d=1 via explicit differencing; this is equivalent to reporting ARIMA(1,1,1) on levels.
+        fitted = ARIMA(
+            diff_train,
             order=(1, 0, 1),
             enforce_stationarity=False,
             enforce_invertibility=False,
-        )
-        fitted = model.fit()
-        diff_forecast = fitted.forecast(steps=max(4, int(horizon_weeks)))
-        dvals = [float(v) for v in diff_forecast if v is not None and math.isfinite(float(v))]
-        if not dvals:
-            return None
+        ).fit()
 
-        # Reconstruct level forecast from differenced forecast.
-        last_level = float(series[-1])
+        holdout_diff_forecast = fitted.forecast(steps=holdout_weeks)
+        holdout_diffs = [float(v) for v in holdout_diff_forecast]
+        holdout_level_pred = []
+        running = float(train_series[-1])
+        for dv in holdout_diffs:
+            running += dv
+            holdout_level_pred.append(running)
+
+        naive_last_pred = [float(train_series[-1])] * holdout_weeks
+        trailing_mean = sum(train_series[-min(8, len(train_series)):]) / min(8, len(train_series))
+        mean_pred = [float(trailing_mean)] * holdout_weeks
+
+        mae_arima = _mae(test_series, holdout_level_pred)
+        rmse_arima = _rmse(test_series, holdout_level_pred)
+        mae_naive = _mae(test_series, naive_last_pred)
+        rmse_naive = _rmse(test_series, naive_last_pred)
+        mae_mean = _mae(test_series, mean_pred)
+        rmse_mean = _rmse(test_series, mean_pred)
+
+        forecast_diff = fitted.forecast(steps=max(4, int(horizon_weeks)))
         level_forecast = []
-        running = last_level
-        for dv in dvals:
+        running = float(series[-1])
+        for dv in [float(v) for v in forecast_diff]:
             running += dv
             level_forecast.append(running)
         if not level_forecast:
             return None
 
         avg_fc = sum(level_forecast) / len(level_forecast)
-        return _clip_0_100(avg_fc)
+        clipped_upper = avg_fc > 100.0
+        clipped_lower = avg_fc < 0.0
+        residuals = []
+        for r in fitted.resid:
+            try:
+                fr = float(r)
+            except Exception:
+                continue
+            if math.isfinite(fr):
+                residuals.append(fr)
+
+        adf_stat = None
+        adf_pvalue = None
+        try:
+            adf_res = adfuller(diff_train)
+            adf_stat = float(adf_res[0])
+            adf_pvalue = float(adf_res[1])
+        except Exception:
+            pass
+
+        lb_pvalue = None
+        try:
+            lb_lag = min(10, max(3, len(residuals) // 8))
+            lb = acorr_ljungbox(residuals, lags=[lb_lag], return_df=True)
+            lb_pvalue = float(lb["lb_pvalue"].iloc[-1])
+        except Exception:
+            pass
+
+        residual_mean = sum(residuals) / len(residuals) if residuals else 0.0
+        beats_naive = rmse_arima <= rmse_naive if rmse_naive > 0 else True
+        beats_mean = rmse_arima <= rmse_mean if rmse_mean > 0 else True
+
+        return {
+            "futureScore": _clip_0_100(avg_fc),
+            "unclippedFutureScore": round(float(avg_fc), 3),
+            "clippedUpper": bool(clipped_upper),
+            "clippedLower": bool(clipped_lower),
+            "modelOrder": "ARIMA(1,1,1)",
+            "estimationOrder": "ARIMA(1,0,1) on differenced series",
+            "differenceOrder": 1,
+            "trainingPoints": len(train_series),
+            "holdoutPoints": len(test_series),
+            "forecastHorizonWeeks": int(horizon_weeks),
+            "adfStatistic": round(adf_stat, 4) if adf_stat is not None else None,
+            "adfPValue": round(adf_pvalue, 4) if adf_pvalue is not None else None,
+            "aic": round(float(fitted.aic), 2) if hasattr(fitted, "aic") else None,
+            "bic": round(float(fitted.bic), 2) if hasattr(fitted, "bic") else None,
+            "residualMean": round(float(residual_mean), 4),
+            "ljungBoxPValue": round(lb_pvalue, 4) if lb_pvalue is not None else None,
+            "holdoutMAE": round(float(mae_arima), 3),
+            "holdoutRMSE": round(float(rmse_arima), 3),
+            "naiveMAE": round(float(mae_naive), 3),
+            "naiveRMSE": round(float(rmse_naive), 3),
+            "rollingMeanMAE": round(float(mae_mean), 3),
+            "rollingMeanRMSE": round(float(rmse_mean), 3),
+            "beatsNaive": bool(beats_naive),
+            "beatsRollingMean": bool(beats_mean),
+        }
     except Exception:
         return None
 
@@ -1979,7 +2476,12 @@ def _timeline_from_google_zscore(trends_payload: dict) -> dict | None:
     slope = _simple_slope(present_vals[-8:] if len(present_vals) >= 8 else present_vals)
     future_raw = present_score + slope * 12 + (z * 4.0)
     future_score_momentum = _clip_0_100(future_raw)
-    future_score_arima = _arima_future_score(vals, horizon_weeks=52)
+    arima_robustness = _arima_robustness(vals, horizon_weeks=52)
+    future_score_arima = (
+        int(arima_robustness["futureScore"])
+        if isinstance(arima_robustness, dict) and arima_robustness.get("futureScore") is not None
+        else None
+    )
     future_score = future_score_arima if future_score_arima is not None else future_score_momentum
     method = "google_arima_live" if future_score_arima is not None else "google_zscore_live"
 
@@ -2018,11 +2520,16 @@ def _timeline_from_google_zscore(trends_payload: dict) -> dict | None:
         "pastSummary": f"Google Trends baseline over the prior period averaged {past_score}/100.",
         "presentSummary": f"Recent period averages {present_score}/100 (z-score {z:+.2f}, weekly slope {slope:+.2f}).",
         "futureSummary": (
-            f"ARIMA projection implies ~{future_score}/100 next period."
+            (
+                f"ARIMA projection implies ~{future_score}/100 next period; "
+                f"holdout RMSE {arima_robustness.get('holdoutRMSE')}, "
+                f"naive RMSE {arima_robustness.get('naiveRMSE')}."
+            )
             if method == "google_arima_live"
             else f"Short-horizon projection from momentum implies ~{future_score}/100 next period."
         ),
         "method": method,
+        "arimaRobustness": arima_robustness,
     }
 
 
@@ -2177,87 +2684,15 @@ async def analyze(request: Request):
 
     model = (body.get("model") or "").strip() or OPENAI_MODEL
 
-    # Collect live signals so the model can reason over the same data used in the report.
-    live_context = {
-        "news": None,
-        "trends": None,
-        "ebayPricing": None,
-        "ebayMap": None,
-        "wtoTrade": None,
-        "storedPricingHistoryWeekly": [],
-        "computedTrendTimeline": None,
-        "computedPricingModel": None,
-        "warnings": [],
-    }
-    try:
-        live_context["news"] = await get_news(category)
-    except Exception as e:
-        live_context["warnings"].append(f"news unavailable: {type(e).__name__}")
-    try:
-        live_context["trends"] = await get_trends(category, geo="US", days=728)
-    except Exception as e:
-        live_context["warnings"].append(f"trends unavailable: {type(e).__name__}")
-    try:
-        live_context["ebayPricing"] = await _fetch_ebay_pricing(category, limit=1000)
-    except Exception as e:
-        live_context["warnings"].append(f"ebay unavailable: {type(e).__name__}")
-    try:
-        live_context["ebayMap"] = await get_ebay_price_map(category, limit=1000)
-    except Exception as e:
-        live_context["warnings"].append(f"ebay map unavailable: {type(e).__name__}")
-    try:
-        live_context["wtoTrade"] = await _fetch_wto_trade_context(
-            years=WTO_DEFAULT_YEARS,
-            reporter_code=WTO_REPORTER_CODE,
-            product_query=category,
-            partner_code=wto_partner_code,
-            hs_code=wto_hs_code,
-            strict_targeted=wto_strict_targeted,
-        )
-    except Exception as e:
-        live_context["warnings"].append(f"wto unavailable: {type(e).__name__}")
-    try:
-        live_context["storedPricingHistoryWeekly"] = _load_recent_weekly_points(category, weeks=104)
-    except Exception as e:
-        live_context["warnings"].append(f"stored pricing history unavailable: {type(e).__name__}")
-
-    trends_live = live_context.get("trends")
-    if (
-        isinstance(trends_live, dict)
-        and isinstance(trends_live.get("score"), (int, float))
-        and isinstance(trends_live.get("points"), list)
-        and len(trends_live.get("points")) > 0
-    ):
-        try:
-            live_context["computedTrendTimeline"] = _timeline_from_google_zscore(trends_live)
-        except Exception as e:
-            live_context["warnings"].append(f"trend timeline model unavailable: {type(e).__name__}")
-
-    ebay_live = live_context.get("ebayPricing")
-    if isinstance(ebay_live, dict) and ebay_live.get("currentAvgPrice") is not None and ebay_live.get("sampleSize", 0) >= 3:
-        try:
-            current = float(ebay_live.get("currentAvgPrice") or 0)
-            low = float(ebay_live.get("typicalPriceRangeLow") or current)
-            high = float(ebay_live.get("typicalPriceRangeHigh") or current)
-            pricing_model = {
-                "currentAvgPrice": current,
-                "typicalPriceRangeLow": low,
-                "typicalPriceRangeHigh": high,
-                "forecastAvgPrice12mo": round(current * 1.04, 2),
-                "forecastAvgPrice24mo": round(current * 1.08, 2),
-                "priceChangeYoY": 0.0,
-                "priceTrend": "STABLE",
-                "priceOutlook": "NEUTRAL",
-                "liveSource": ebay_live.get("source", "eBay"),
-                "liveSampleSize": int(ebay_live.get("sampleSize", 0)),
-            }
-            _reconcile_live_pricing_with_forecast(pricing_model)
-            pricing_model["monthlyHistory"] = _build_expanded_weekly_history(
-                category, pricing_model, hist_weeks=104, proj_weeks=52
-            )
-            live_context["computedPricingModel"] = pricing_model
-        except Exception as e:
-            live_context["warnings"].append(f"pricing model unavailable: {type(e).__name__}")
+    live_context, agent_trace = await _build_agentic_live_context(
+        category,
+        api_key=api_key,
+        model=model,
+        wto_partner_code=wto_partner_code,
+        wto_hs_code=wto_hs_code,
+        wto_strict_targeted=wto_strict_targeted,
+        user_objective=f"Produce a grounded market intelligence report for {category}.",
+    )
 
     current_year = datetime.utcnow().year
     past_year = current_year - 1
@@ -2279,6 +2714,7 @@ Guidance:
 - monthlyHistory: include a reasonable mix of historical vs projected entries.
 - Use every available live/computed context section to ground scores and narrative.
 - Explicitly reference specialized tool signals where relevant (NewsAPI, Google Trends, eBay pricing/map, WTO trade context).
+- You are operating after an agent planning loop. Use the plan and tool evidence to explain what mattered most.
 - You may use general model knowledge for context not present in tools, but do not invent specific live facts.
 """
 
@@ -2290,6 +2726,10 @@ Guidance:
             {
                 "role": "user",
                 "content": "Live context JSON:\n" + json.dumps(live_context, ensure_ascii=True),
+            },
+            {
+                "role": "user",
+                "content": "Agent trace JSON:\n" + json.dumps(agent_trace, ensure_ascii=True),
             },
         ],
         # Structured Outputs (Responses API uses text.format)
@@ -2339,6 +2779,7 @@ Guidance:
     parsed["competitionAnalysis"] = str(parsed.get("competitionAnalysis") or "")
     parsed["politicalAnalysis"] = str(parsed.get("politicalAnalysis") or "")
     parsed["inputBreakdownAnalysis"] = str(parsed.get("inputBreakdownAnalysis") or "")
+    parsed["agentTrace"] = agent_trace
 
     # Prefer live eBay pricing for current price/range when available.
     ebay = live_context.get("ebayPricing")
@@ -2385,6 +2826,7 @@ Guidance:
             parsed["presentSummary"] = str(timeline_live["presentSummary"])
             parsed["futureSummary"] = str(timeline_live["futureSummary"])
             parsed["timelineMethod"] = str(timeline_live.get("method") or "google_zscore_live")
+            parsed["arimaRobustness"] = timeline_live.get("arimaRobustness")
 
     if str(pricing.get("liveSource", "")).lower().startswith("ebay"):
         _reconcile_live_pricing_with_forecast(pricing)
@@ -2450,23 +2892,24 @@ async def chat_followup(request: Request):
         if role in ("user", "assistant") and content:
             trimmed_history.append({"role": role, "content": content[:2000]})
 
-    wto_trade = None
-    try:
-        wto_trade = await _fetch_wto_trade_context(
-            years=WTO_DEFAULT_YEARS,
-            reporter_code=WTO_REPORTER_CODE,
-            product_query=category,
-            partner_code=wto_partner_code,
-            hs_code=wto_hs_code,
-            strict_targeted=wto_strict_targeted,
+    live_context = None
+    agent_trace = None
+    if category:
+        live_context, agent_trace = await _build_agentic_live_context(
+            category,
+            api_key=api_key,
+            model=model,
+            wto_partner_code=wto_partner_code,
+            wto_hs_code=wto_hs_code,
+            wto_strict_targeted=wto_strict_targeted,
+            user_objective=question,
         )
-    except Exception:
-        wto_trade = None
 
     context_payload = {
         "category": category,
         "report": report if isinstance(report, dict) else None,
-        "wtoTrade": wto_trade,
+        "liveContext": live_context,
+        "agentTrace": agent_trace,
     }
 
     input_msgs = [
@@ -2475,7 +2918,7 @@ async def chat_followup(request: Request):
             "content": (
                 "You are TrendPulse Follow-up Assistant. "
                 "Use a hybrid approach: prioritize provided report/tool context, and supplement with general model knowledge when needed. "
-                "When WTO trade context is present, use it for tariff/trade-policy portions of the answer. "
+                "When live tool context is present, use it for pricing, demand, and tariff/trade-policy portions of the answer. "
                 "Always structure the response with these exact headings: "
                 "'From Report/Tools', 'From General Knowledge', and 'Combined Implication'. "
                 "If a section has no content, write 'None'. "
@@ -2510,6 +2953,6 @@ async def chat_followup(request: Request):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Could not parse follow-up response: {type(e).__name__}")
 
-    return {"answer": text}
+    return {"answer": text, "agentTrace": agent_trace}
 
 

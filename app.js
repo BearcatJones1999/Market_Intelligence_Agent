@@ -115,6 +115,50 @@ function hasNumber(x) {
   return typeof x === "number" && Number.isFinite(x);
 }
 
+function renderArimaRobustnessCard(ar) {
+  if (!ar || typeof ar !== "object") return "";
+  const adfText = hasNumber(ar.adfPValue) ? Number(ar.adfPValue).toFixed(4) : "n/a";
+  const lbText = hasNumber(ar.ljungBoxPValue) ? Number(ar.ljungBoxPValue).toFixed(4) : "n/a";
+  const rmseText = hasNumber(ar.holdoutRMSE) ? Number(ar.holdoutRMSE).toFixed(2) : "n/a";
+  const naiveText = hasNumber(ar.naiveRMSE) ? Number(ar.naiveRMSE).toFixed(2) : "n/a";
+  const meanText = hasNumber(ar.rollingMeanRMSE) ? Number(ar.rollingMeanRMSE).toFixed(2) : "n/a";
+  const clippedNote = ar.clippedUpper
+    ? `Forecast ceiling note: unconstrained ARIMA average is ${esc(
+        hasNumber(ar.unclippedFutureScore) ? Number(ar.unclippedFutureScore).toFixed(2) : "n/a"
+      )}, so the displayed forecast is capped at Google Trends' 100 upper bound.`
+    : "";
+  return `<div class="section-card" style="margin-bottom:20px">
+    <div class="section-heading">ARIMA Robustness <span class="ai-badge" style="font-size:9px">model evidence</span></div>
+    <div class="arima-grid" style="margin-bottom:14px">
+      <div class="stat-card arima-stat-card">
+        <div class="stat-label">Specification</div>
+        <div class="arima-stat-value purple">${esc(ar.modelOrder || "ARIMA")}</div>
+        <div class="arima-stat-sub">Difference order ${esc(ar.differenceOrder || 1)}</div>
+        <div class="arima-stat-sub">Train ${esc(ar.trainingPoints || "n/a")} | Holdout ${esc(ar.holdoutPoints || "n/a")}</div>
+      </div>
+      <div class="stat-card arima-stat-card">
+        <div class="stat-label">Holdout RMSE</div>
+        <div class="arima-stat-value blue">${esc(rmseText)}</div>
+        <div class="arima-stat-sub">Naive baseline ${esc(naiveText)}</div>
+        <div class="arima-stat-sub">Rolling mean baseline ${esc(meanText)}</div>
+      </div>
+      <div class="stat-card arima-stat-card">
+        <div class="stat-label">Stationarity</div>
+        <div class="arima-stat-value ${hasNumber(ar.adfPValue) && Number(ar.adfPValue) < 0.05 ? "green" : "amber"}">ADF p=${esc(adfText)}</div>
+        <div class="arima-stat-sub">Lower than 0.05 suggests the differenced series is stationary.</div>
+      </div>
+      <div class="stat-card arima-stat-card">
+        <div class="stat-label">Residual Check</div>
+        <div class="arima-stat-value ${hasNumber(ar.ljungBoxPValue) && Number(ar.ljungBoxPValue) > 0.05 ? "green" : "amber"}">LB p=${esc(lbText)}</div>
+        <div class="arima-stat-sub">Higher than 0.05 suggests residual autocorrelation is limited.</div>
+        <div class="arima-stat-sub">AIC ${esc(ar.aic ?? "n/a")} | BIC ${esc(ar.bic ?? "n/a")}</div>
+      </div>
+    </div>
+    <div class="stat-sub">Benchmark comparison: ARIMA ${ar.beatsNaive ? "beats" : "does not beat"} naive carry-forward and ${ar.beatsRollingMean ? "beats" : "does not beat"} rolling-mean on the holdout window.</div>
+    ${clippedNote ? `<div class="stat-sub" style="margin-top:8px">${clippedNote}</div>` : ""}
+  </div>`;
+}
+
 function explainWtoIndicator(w) {
   const code = String(w?.indicator || "").toUpperCase();
   const hsCategory = String(w?.usedHsCategory || w?.hsCategory || "").trim();
@@ -134,6 +178,98 @@ function explainWtoIndicator(w) {
     return `Partner-specific preferential tariff at HS level (sparse coverage).${hsSuffix}`;
   }
   return `${String(w?.indicatorLabel || "WTO tariff indicator")}.${hsSuffix}`;
+}
+
+function humanizeToolName(name = "") {
+  return String(name || "")
+    .replace(/_/g, " ")
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function renderAgentTraceCard(agentTrace) {
+  if (!agentTrace || typeof agentTrace !== "object") return "";
+  const toolPlan = Array.isArray(agentTrace.toolPlan) ? agentTrace.toolPlan : [];
+  const additionalTools = Array.isArray(agentTrace.additionalTools) ? agentTrace.additionalTools : [];
+  const toolRuns = Array.isArray(agentTrace.toolRuns) ? agentTrace.toolRuns : [];
+  const warnings = Array.isArray(agentTrace.warnings) ? agentTrace.warnings : [];
+  const reflection = agentTrace.reflection || {};
+
+  return `<div class="section-card agent-card" style="margin-bottom:20px">
+    <div class="section-heading">Agent Workflow <span class="live-badge" style="font-size:9px">plan-act-observe</span></div>
+    <div class="agent-grid">
+      <div class="agent-panel">
+        <div class="agent-label">Objective</div>
+        <div class="agent-text">${esc(agentTrace.objective || "No objective recorded.")}</div>
+      </div>
+      <div class="agent-panel">
+        <div class="agent-label">Planner Reasoning</div>
+        <div class="agent-text">${esc(agentTrace.planReasoning || "No planner notes recorded.")}</div>
+      </div>
+      <div class="agent-panel">
+        <div class="agent-label">Primary Tools</div>
+        <div class="agent-chip-row">${
+          toolPlan.length
+            ? toolPlan.map((tool) => `<span class="agent-chip">${esc(humanizeToolName(tool))}</span>`).join("")
+            : `<span class="agent-empty">No tools recorded.</span>`
+        }</div>
+      </div>
+      <div class="agent-panel">
+        <div class="agent-label">Reflection</div>
+        <div class="agent-text">Confidence: ${esc(reflection.confidence || "n/a")}</div>
+        <div class="agent-sub">${esc(reflection.stopReason || "No reflection summary recorded.")}</div>
+        ${
+          additionalTools.length
+            ? `<div class="agent-sub" style="margin-top:8px">Second pass: ${esc(
+                additionalTools.map(humanizeToolName).join(", ")
+              )}</div>`
+            : `<div class="agent-sub" style="margin-top:8px">Second pass: none needed</div>`
+        }
+      </div>
+    </div>
+    ${
+      agentTrace.clarificationRequested && agentTrace.clarifyingQuestion
+        ? `<div class="agent-note">Clarification the agent considered asking: ${esc(agentTrace.clarifyingQuestion)}</div>`
+        : ""
+    }
+    ${
+      toolRuns.length
+        ? `<div class="agent-runs">${toolRuns
+            .map(
+              (run) => `<div class="agent-run">
+                <div class="agent-run-head">
+                  <span class="agent-run-name">${esc(humanizeToolName(run.tool || ""))}</span>
+                  <span class="agent-run-status ${run.status === "error" ? "error" : "ok"}">${esc(
+                    run.status || "ok"
+                  )}</span>
+                </div>
+                <div class="agent-run-summary">${esc(run.summary || "")}</div>
+              </div>`
+            )
+            .join("")}</div>`
+        : ""
+    }
+    ${
+      warnings.length
+        ? `<div class="agent-note warning">Warnings: ${esc(warnings.join(" | "))}</div>`
+        : ""
+    }
+  </div>`;
+}
+
+function renderAgentTraceMini(agentTrace) {
+  if (!agentTrace || typeof agentTrace !== "object") return "";
+  const toolPlan = Array.isArray(agentTrace.toolPlan) ? agentTrace.toolPlan : [];
+  const additionalTools = Array.isArray(agentTrace.additionalTools) ? agentTrace.additionalTools : [];
+  return `<div class="followup-trace">
+    <div class="followup-trace-title">Agent trace</div>
+    <div class="followup-trace-text">${esc(agentTrace.objective || "Follow-up evidence gathering")}</div>
+    <div class="followup-trace-text">Tools: ${esc(
+      toolPlan.length ? toolPlan.map(humanizeToolName).join(", ") : "none recorded"
+    )}</div>
+    <div class="followup-trace-text">Second pass: ${esc(
+      additionalTools.length ? additionalTools.map(humanizeToolName).join(", ") : "none"
+    )}</div>
+  </div>`;
 }
 
 // -- Init ---------------------------------------------------------------------
@@ -733,6 +869,8 @@ function renderResults() {
     </div>
   </div>`;
 
+  html += renderAgentTraceCard(r.agentTrace);
+
   // Signal scores
   const googleBadge = googleIsLive
     ? `<span class="live-badge">LIVE</span>`
@@ -803,6 +941,8 @@ function renderResults() {
       <div class="chart-wrap">${buildTrendsInterestSVG(t.points, Number(r.futureScore ?? r.presentScore ?? t.score))}</div>
     </div>`;
   }
+
+  html += renderArimaRobustnessCard(r.arimaRobustness);
 
   // Trend velocity bars
   html += `<div class="section-card" style="margin-bottom:20px">
@@ -1089,6 +1229,7 @@ function renderFollowupThread() {
       (m) => `<div class="followup-msg ${m.role === "assistant" ? "assistant" : "user"}">
         <div class="followup-role">${m.role === "assistant" ? "Assistant" : "You"}</div>
         <div class="followup-text">${esc(m.content || "")}</div>
+        ${m.role === "assistant" ? renderAgentTraceMini(m.agentTrace) : ""}
       </div>`
     )
     .join("");
@@ -1130,7 +1271,7 @@ async function askFollowupQuestion() {
     const data = await resp.json();
     const answer = String(data.answer || "").trim() || "No response returned.";
     followupMessages.pop(); // remove Thinking...
-    followupMessages.push({ role: "assistant", content: answer });
+    followupMessages.push({ role: "assistant", content: answer, agentTrace: data.agentTrace || null });
   } catch (err) {
     followupMessages.pop(); // remove Thinking...
     followupMessages.push({ role: "assistant", content: `Error: ${err.message || String(err)}` });
@@ -1338,6 +1479,21 @@ function buildReportHTML(r, n, t, w) {
   ${trendsSVG}`
       : ""
   }
+
+  ${(() => {
+    const ar = r.arimaRobustness;
+    if (!ar || typeof ar !== "object") return "";
+    const adfText = hasNumber(ar.adfPValue) ? Number(ar.adfPValue).toFixed(4) : "n/a";
+    const lbText = hasNumber(ar.ljungBoxPValue) ? Number(ar.ljungBoxPValue).toFixed(4) : "n/a";
+    return `<div class="sec-title">ARIMA Robustness <span class="badge-pill ai" style="font-size:8px">evidence</span></div>
+  <div class="grid-4">
+    <div class="stat"><div class="stat-lbl">Specification</div><div class="stat-val c-purple">${esc(ar.modelOrder || "ARIMA")}</div><div class="stat-sub">Train ${esc(ar.trainingPoints || "n/a")}  Holdout ${esc(ar.holdoutPoints || "n/a")}</div></div>
+    <div class="stat"><div class="stat-lbl">Holdout RMSE</div><div class="stat-val c-blue">${esc(hasNumber(ar.holdoutRMSE) ? Number(ar.holdoutRMSE).toFixed(2) : "n/a")}</div><div class="stat-sub">Naive ${esc(hasNumber(ar.naiveRMSE) ? Number(ar.naiveRMSE).toFixed(2) : "n/a")}  Mean ${esc(hasNumber(ar.rollingMeanRMSE) ? Number(ar.rollingMeanRMSE).toFixed(2) : "n/a")}</div></div>
+    <div class="stat"><div class="stat-lbl">ADF p-value</div><div class="stat-val c-${hasNumber(ar.adfPValue) && Number(ar.adfPValue) < 0.05 ? "green" : "amber"}">${esc(adfText)}</div><div class="stat-sub">Difference order ${esc(ar.differenceOrder || 1)}</div></div>
+    <div class="stat"><div class="stat-lbl">Ljung-Box p</div><div class="stat-val c-${hasNumber(ar.ljungBoxPValue) && Number(ar.ljungBoxPValue) > 0.05 ? "green" : "amber"}">${esc(lbText)}</div><div class="stat-sub">AIC ${esc(ar.aic ?? "n/a")}  BIC ${esc(ar.bic ?? "n/a")}</div></div>
+  </div>
+  <div style="font-size:10px;color:#8c897e;margin-top:8px">Benchmark comparison: ARIMA ${ar.beatsNaive ? "beats" : "does not beat"} naive carry-forward and ${ar.beatsRollingMean ? "beats" : "does not beat"} rolling-mean on the holdout sample.</div>`;
+  })()}
 
   <div class="sec-title">Trend Velocity <span class="badge-pill ${
     timelineIsLive ? "live" : "ai"
