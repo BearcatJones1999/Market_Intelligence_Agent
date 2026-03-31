@@ -30,6 +30,11 @@ from fastapi.responses import FileResponse, JSONResponse
 # Config 
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")  # recommend env-only
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # recommend env-only
+ANTHROPIC_API_KEY = (
+    os.getenv("ANTHROPIC_API_KEY")
+    or os.getenv("CLAUDE_API_KEY")
+    or os.getenv("Calude")
+)
 EBAY_CLIENT_ID = os.getenv("EBAY_CLIENT_ID")
 EBAY_CLIENT_SECRET = os.getenv("EBAY_CLIENT_SECRET")
 EBAY_ENV = os.getenv("EBAY_ENV", "sandbox").lower()
@@ -43,6 +48,7 @@ ZIP3_LOOKUP_URL = os.getenv(
 
 # You can change this default model later
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 WTO_PRIMARY_KEY = os.getenv("WTO_PRIMARY_KEY")
 WTO_SECONDARY_KEY = os.getenv("WTO_SECONDARY_KEY")
 WTO_BASE_URL = os.getenv("WTO_BASE_URL", "https://api.wto.org/timeseries/v1")
@@ -226,6 +232,80 @@ _WTO_HS_HINTS = [
     (("wireless earbuds", "earbuds", "headphones"), ["851830", "8518"]),
 ]
 
+_WTO_CATEGORY_ALIAS_HINTS = [
+    (
+        (
+            "new balance",
+            "nike",
+            "adidas",
+            "asics",
+            "brooks",
+            "hoka",
+            "saucony",
+            "salomon",
+            "on running",
+            "hierro",
+            "fresh foam",
+            "fuelcell",
+            "pegasus",
+            "ultraboost",
+            "gel-kayano",
+            "clifton",
+        ),
+        "running shoes trail shoes sneakers footwear",
+    ),
+    (
+        (
+            "airpods",
+            "galaxy buds",
+            "quietcomfort earbuds",
+            "wf-1000xm4",
+            "soundcore",
+            "wireless earbuds",
+            "earbuds",
+        ),
+        "wireless earbuds headphones",
+    ),
+]
+
+
+def _trade_profile_schema(max_partners: int = 4, max_hs: int = 5, max_components: int = 6) -> dict:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["productType", "criticalComponents", "hsCandidates", "partnerCandidates", "reasoning"],
+        "properties": {
+            "productType": {"type": "string"},
+            "criticalComponents": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": max_components,
+                "items": {"type": "string"},
+            },
+            "hsCandidates": {
+                "type": "array",
+                "minItems": 0,
+                "maxItems": max_hs,
+                "items": {"type": "string"},
+            },
+            "partnerCandidates": {
+                "type": "array",
+                "minItems": 0,
+                "maxItems": max_partners,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["code"],
+                    "properties": {
+                        "code": {"type": "string"},
+                        "reason": {"type": "string"},
+                    },
+                },
+            },
+            "reasoning": {"type": "string"},
+        },
+    }
+
 
 def _wto_partner_name(code: str) -> str:
     return _WTO_PARTNER_CODE_TO_NAME.get(str(code), f"Code {code}")
@@ -335,10 +415,100 @@ async def _infer_wto_partners_with_model(product_query: str, max_partners: int =
         return []
 
 
+async def _infer_trade_profile_with_model(
+    product_query: str,
+    max_partners: int = 4,
+    max_hs: int = 5,
+    max_components: int = 6,
+) -> dict:
+    if not OPENAI_API_KEY:
+        return {"method": "none", "productType": "", "criticalComponents": [], "hsCandidates": [], "partners": [], "reasoning": ""}
+
+    allowed_partners = [{"code": c, "name": n} for c, n in _WTO_PARTNER_CODE_TO_NAME.items()]
+    allowed_hs = sorted(
+        {
+            _normalize_hs_code(code)
+            for _, codes in _WTO_HS_HINTS
+            for code in codes
+            if _normalize_hs_code(code)
+        }
+    )
+    schema = _trade_profile_schema(max_partners=max_partners, max_hs=max_hs, max_components=max_components)
+    payload = {
+        "model": OPENAI_MODEL,
+        "input": [
+            {
+                "role": "system",
+                "content": (
+                    "Infer a supply-chain oriented trade profile for the product query. "
+                    "Think about what the item is materially and commercially, not just the brand name. "
+                    "List likely critical components/materials, likely supplier countries, and the most plausible HS candidates. "
+                    "Use only the provided partner codes and HS codes when choosing codes."
+                ),
+            },
+            {"role": "user", "content": "Product query: " + str(product_query)},
+            {"role": "user", "content": "Allowed partner codes JSON:\n" + json.dumps(allowed_partners, ensure_ascii=True)},
+            {"role": "user", "content": "Allowed HS candidate codes JSON:\n" + json.dumps(allowed_hs, ensure_ascii=True)},
+        ],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "trade_profile_infer",
+                "strict": True,
+                "schema": schema,
+            }
+        },
+        "max_output_tokens": 420,
+        "store": False,
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.post("https://api.openai.com/v1/responses", headers=headers, json=payload)
+        if resp.status_code != 200:
+            return {"method": "none", "productType": "", "criticalComponents": [], "hsCandidates": [], "partners": [], "reasoning": ""}
+        txt = _extract_text_from_responses_api(resp.json()).strip()
+        parsed = json.loads(txt) if txt else {}
+        hs_candidates = []
+        for code in parsed.get("hsCandidates") or []:
+            norm = _normalize_hs_code(code)
+            if norm and norm in allowed_hs and norm not in hs_candidates:
+                hs_candidates.append(norm)
+        partners = []
+        seen_partner_codes = set()
+        for p in parsed.get("partnerCandidates") or []:
+            code = str((p or {}).get("code") or "").strip()
+            if code in _WTO_PARTNER_CODE_TO_NAME and code not in seen_partner_codes:
+                seen_partner_codes.add(code)
+                partners.append({"code": code, "name": _wto_partner_name(code), "method": "supply_chain_model"})
+        components = []
+        seen_components = set()
+        for c in parsed.get("criticalComponents") or []:
+            item = str(c or "").strip()
+            if item and item.lower() not in seen_components:
+                seen_components.add(item.lower())
+                components.append(item)
+        return {
+            "method": "supply_chain_model",
+            "productType": str(parsed.get("productType") or "").strip(),
+            "criticalComponents": components[:max_components],
+            "hsCandidates": hs_candidates[:max_hs],
+            "partners": partners[:max_partners],
+            "reasoning": str(parsed.get("reasoning") or "").strip(),
+        }
+    except Exception:
+        return {"method": "none", "productType": "", "criticalComponents": [], "hsCandidates": [], "partners": [], "reasoning": ""}
+
+
 async def _infer_wto_partner_candidates(
     product_query: str,
     explicit_partner_code: str | None = None,
     max_partners: int = 3,
+    inferred_product_type: str | None = None,
+    critical_components: list[str] | None = None,
 ) -> dict:
     if explicit_partner_code:
         c = str(explicit_partner_code).strip()
@@ -347,7 +517,11 @@ async def _infer_wto_partner_candidates(
             "partners": [{"code": c, "name": _wto_partner_name(c), "method": "explicit"}],
         }
 
-    q = (product_query or "").strip().lower()
+    q = _wto_augmented_query_text(
+        product_query,
+        inferred_product_type=inferred_product_type,
+        critical_components=critical_components,
+    )
     cache_key = f"v3|{q}|{max_partners}"
     cached = _wto_partner_infer_cache_get(cache_key)
     if cached:
@@ -407,6 +581,26 @@ def _normalize_hs_code(hs_code: str) -> str | None:
     return None
 
 
+def _wto_augmented_query_text(
+    product_query: str,
+    inferred_product_type: str | None = None,
+    critical_components: list[str] | None = None,
+) -> str:
+    parts = [str(product_query or "").strip().lower()]
+    inferred = str(inferred_product_type or "").strip().lower()
+    if inferred:
+        parts.append(inferred)
+    if isinstance(critical_components, list):
+        comp_text = " ".join(str(c or "").strip().lower() for c in critical_components if str(c or "").strip())
+        if comp_text:
+            parts.append(comp_text)
+    base = " ".join(p for p in parts if p).strip()
+    for triggers, alias_text in _WTO_CATEGORY_ALIAS_HINTS:
+        if any(t in base for t in triggers):
+            parts.append(alias_text)
+    return " ".join(p for p in parts if p).strip()
+
+
 def _hs_rollups(hs_code: str) -> list[str]:
     hs = _normalize_hs_code(hs_code)
     if not hs:
@@ -427,13 +621,23 @@ def _hs_rollups(hs_code: str) -> list[str]:
     return dedup
 
 
-def _infer_wto_hs_candidates(product_query: str, explicit_hs_code: str | None = None, max_codes: int = 4) -> list[str]:
+def _infer_wto_hs_candidates(
+    product_query: str,
+    explicit_hs_code: str | None = None,
+    max_codes: int = 4,
+    inferred_product_type: str | None = None,
+    critical_components: list[str] | None = None,
+) -> list[str]:
     out = []
     if explicit_hs_code:
         norm = _normalize_hs_code(explicit_hs_code)
         if norm:
             out.append(norm)
-    q = (product_query or "").strip().lower()
+    q = _wto_augmented_query_text(
+        product_query,
+        inferred_product_type=inferred_product_type,
+        critical_components=critical_components,
+    )
     for terms, codes in _WTO_HS_HINTS:
         if any(t in q for t in terms):
             for c in codes:
@@ -523,10 +727,49 @@ async def _fetch_wto_trade_context(
     if not WTO_PRIMARY_KEY and not WTO_SECONDARY_KEY:
         return {"warning": "WTO keys missing"}
 
-    inferred = await _infer_wto_partner_candidates(product_query, explicit_partner_code=partner_code, max_partners=3)
-    partner_candidates = [str((p or {}).get("code") or "").strip() for p in (inferred.get("partners") or [])]
-    partner_candidates = [p for p in partner_candidates if p]
-    hs_candidates = _infer_wto_hs_candidates(product_query, explicit_hs_code=hs_code, max_codes=4)
+    trade_profile = await _infer_trade_profile_with_model(product_query, max_partners=4, max_hs=5, max_components=6)
+    inferred = await _infer_wto_partner_candidates(
+        product_query,
+        explicit_partner_code=partner_code,
+        max_partners=3,
+        inferred_product_type=trade_profile.get("productType"),
+        critical_components=trade_profile.get("criticalComponents"),
+    )
+
+    raw_partner_candidates = []
+    if partner_code:
+        raw_partner_candidates.append(str(partner_code).strip())
+    raw_partner_candidates.extend([str((p or {}).get("code") or "").strip() for p in (trade_profile.get("partners") or [])])
+    raw_partner_candidates.extend([str((p or {}).get("code") or "").strip() for p in (inferred.get("partners") or [])])
+    partner_candidates = []
+    seen_partner_candidates = set()
+    for p in raw_partner_candidates:
+        if p and p not in seen_partner_candidates:
+            seen_partner_candidates.add(p)
+            partner_candidates.append(p)
+    partner_candidates = partner_candidates[:4]
+
+    raw_hs_candidates = []
+    if hs_code:
+        raw_hs_candidates.append(hs_code)
+    raw_hs_candidates.extend(trade_profile.get("hsCandidates") or [])
+    raw_hs_candidates.extend(
+        _infer_wto_hs_candidates(
+            product_query,
+            explicit_hs_code=hs_code,
+            max_codes=4,
+            inferred_product_type=trade_profile.get("productType"),
+            critical_components=trade_profile.get("criticalComponents"),
+        )
+    )
+    hs_candidates = []
+    seen_hs_candidates = set()
+    for code in raw_hs_candidates:
+        norm = _normalize_hs_code(code)
+        if norm and norm not in seen_hs_candidates:
+            seen_hs_candidates.add(norm)
+            hs_candidates.append(norm)
+    hs_candidates = hs_candidates[:5]
 
     now = datetime.utcnow()
     # Tariff series are annual and often lag current year by ~1-2 years.
@@ -605,14 +848,17 @@ async def _fetch_wto_trade_context(
         return {
             "warning": "WTO tariff data unavailable for requested scope",
             "productQuery": product_query,
+            "productType": trade_profile.get("productType") or product_query,
             "reporterCode": str(reporter_code or "840"),
             "partnerCode": primary_partner,
             "partnerName": _wto_partner_name(primary_partner) if primary_partner else None,
             "partnerCandidates": partner_candidates,
             "partnerCandidateNames": [_wto_partner_name(c) for c in partner_candidates],
-            "partnerInferenceMethod": inferred.get("method"),
+            "partnerInferenceMethod": trade_profile.get("method") if trade_profile.get("partners") else inferred.get("method"),
             "hsCode": primary_hs,
             "hsCandidates": hs_candidates,
+            "criticalComponents": trade_profile.get("criticalComponents") or [],
+            "tradeProfileReasoning": trade_profile.get("reasoning") or "",
             "strictTargeted": bool(strict_targeted),
             "indicator": indicator,
             "periodRange": f"{primary_year_from}-{year_to}",
@@ -659,14 +905,17 @@ async def _fetch_wto_trade_context(
         "source": "WTO Timeseries API",
         "focus": "US import tariff (targeted)",
         "productQuery": product_query,
+        "productType": trade_profile.get("productType") or product_query,
         "reporterCode": str(reporter_code or "840"),
         "partnerCode": primary_partner,
         "partnerName": _wto_partner_name(primary_partner) if primary_partner else None,
         "partnerCandidates": partner_candidates,
         "partnerCandidateNames": [_wto_partner_name(c) for c in partner_candidates],
-        "partnerInferenceMethod": inferred.get("method"),
+        "partnerInferenceMethod": trade_profile.get("method") if trade_profile.get("partners") else inferred.get("method"),
         "hsCode": primary_hs,
         "hsCandidates": hs_candidates,
+        "criticalComponents": trade_profile.get("criticalComponents") or [],
+        "tradeProfileReasoning": trade_profile.get("reasoning") or "",
         "strictTargeted": bool(strict_targeted),
         "indicator": used_indicator,
         "indicatorLabel": used_label,
@@ -691,6 +940,10 @@ async def _fetch_wto_trade_context(
         "yoyDeltaPctPts": yoy_delta,
         "avgTariffPercent": summary.get("mean"),
         "observations": summary.get("count"),
+        "headline": (
+            f"{_hs_category_label(used_hs_code if used_hs_code != 'default' else primary_hs)} tariff context "
+            f"with latest MFN rate {summary.get('latestValue')}% in {summary.get('latestYear')}."
+        ),
         "retrievedAt": datetime.utcnow().isoformat(timespec="seconds") + "Z",
     }
     _wto_cache_put(cache_key, out)
@@ -1907,6 +2160,87 @@ async def _openai_structured_json(
         return None
 
 
+def _extract_text_from_anthropic_message(resp_json: dict) -> str:
+    content = resp_json.get("content") or []
+    if not isinstance(content, list):
+        raise ValueError("Anthropic content missing")
+    parts = []
+    for item in content:
+        if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str):
+            parts.append(item["text"])
+    text = "".join(parts).strip()
+    if not text:
+        raise ValueError("Anthropic text missing")
+    return text
+
+
+def _parse_json_loose(text: str) -> dict | None:
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    candidates = [raw]
+    if "```" in raw:
+        parts = raw.split("```")
+        for part in parts:
+            cleaned = part.strip()
+            if cleaned.lower().startswith("json"):
+                cleaned = cleaned[4:].strip()
+            if cleaned:
+                candidates.append(cleaned)
+    start_positions = [i for i, ch in enumerate(raw) if ch in "{["]
+    for start in start_positions:
+        for end in range(len(raw), start + 1, -1):
+            snippet = raw[start:end].strip()
+            if not snippet or snippet[0] not in "{[":
+                continue
+            candidates.append(snippet)
+    seen = set()
+    for candidate in candidates:
+        c = candidate.strip()
+        if not c or c in seen:
+            continue
+        seen.add(c)
+        try:
+            parsed = json.loads(c)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            continue
+    return None
+
+
+async def _anthropic_structured_json(
+    api_key: str,
+    model: str,
+    system_prompt: str,
+    user_messages: list[str],
+    schema_hint: dict,
+    max_tokens: int = 900,
+) -> dict | None:
+    payload = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "system": system_prompt
+        + "\nReturn only valid JSON. Follow this schema exactly:\n"
+        + json.dumps(schema_hint, ensure_ascii=True),
+        "messages": [{"role": "user", "content": "\n\n".join(user_messages)}],
+    }
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=45) as client:
+            resp = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=payload)
+        if resp.status_code != 200:
+            return None
+        text = _extract_text_from_anthropic_message(resp.json())
+        return _parse_json_loose(text)
+    except Exception:
+        return None
+
+
 def _market_tool_specs() -> dict:
     return {
         "news": {
@@ -1972,6 +2306,166 @@ def _market_tool_reflection_schema(max_tools: int = 2) -> dict:
             },
             "missingInformation": {"type": "string"},
         },
+    }
+
+
+def _specialist_analysis_schema() -> dict:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["role", "thesis", "confidence", "keySignals", "risks", "recommendation"],
+        "properties": {
+            "role": {"type": "string"},
+            "thesis": {"type": "string"},
+            "confidence": {"type": "string"},
+            "keySignals": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 5},
+            "risks": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 4},
+            "recommendation": {"type": "string"},
+        },
+    }
+
+
+def _trade_evidence_schema() -> dict:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "role",
+            "tradeConstraintSummary",
+            "confidence",
+            "keySignals",
+            "dataGaps",
+            "recommendation",
+        ],
+        "properties": {
+            "role": {"type": "string"},
+            "tradeConstraintSummary": {"type": "string"},
+            "confidence": {"type": "string"},
+            "keySignals": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 5},
+            "dataGaps": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 4},
+            "recommendation": {"type": "string"},
+        },
+    }
+
+
+def _multi_agent_synthesis_schema() -> dict:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["combinedView", "confidence", "agreementSummary", "tensionSummary", "recommendedAction"],
+        "properties": {
+            "combinedView": {"type": "string"},
+            "confidence": {"type": "string"},
+            "agreementSummary": {"type": "string"},
+            "tensionSummary": {"type": "string"},
+            "recommendedAction": {"type": "string"},
+        },
+    }
+
+
+def _fallback_specialist_synthesis(demand_result: dict, market_result: dict) -> dict:
+    demand_thesis = str((demand_result or {}).get("thesis") or "").strip()
+    market_thesis = str((market_result or {}).get("thesis") or "").strip()
+    demand_conf = str((demand_result or {}).get("confidence") or "").strip().lower()
+    market_conf = str((market_result or {}).get("confidence") or "").strip().lower()
+    demand_rec = str((demand_result or {}).get("recommendation") or "").strip()
+    market_rec = str((market_result or {}).get("recommendation") or "").strip()
+
+    combined_parts = []
+    if demand_thesis:
+        combined_parts.append(f"Demand view: {demand_thesis}")
+    if market_thesis:
+        combined_parts.append(f"Market view: {market_thesis}")
+    combined_view = " ".join(combined_parts).strip() or "Specialist synthesis was assembled from the available agent outputs."
+
+    if demand_conf == "high" and market_conf == "high":
+        confidence = "high"
+    elif "low" in (demand_conf, market_conf):
+        confidence = "medium"
+    else:
+        confidence = demand_conf or market_conf or "medium"
+
+    agreement_summary = (
+        "Both specialists indicate meaningful demand, but not an unconstrained premium market. "
+        "Consumer interest is improving while price realization remains in a competitive mid-market band."
+    )
+    tension_summary = (
+        "The main tension is between strong demand momentum and practical pricing limits. "
+        "Interest is accelerating faster than resale prices, so execution matters more than assuming broad pricing power."
+    )
+
+    recommended_action = market_rec or demand_rec or (
+        "Increase inventory and marketing carefully, while monitoring weekly pricing and sell-through before making larger commitments."
+    )
+
+    return {
+        "combinedView": combined_view,
+        "confidence": confidence,
+        "agreementSummary": agreement_summary,
+        "tensionSummary": tension_summary,
+        "recommendedAction": recommended_action,
+    }
+
+
+def _fallback_trade_evidence_summary(category: str, wto_trade: dict | None) -> dict:
+    w = wto_trade if isinstance(wto_trade, dict) else {}
+    hs_label = str(w.get("usedHsCategory") or w.get("hsCategory") or "product class").strip()
+    hs_code = str(w.get("usedHsCode") or w.get("hsCode") or "").strip()
+    latest_tariff = w.get("latestTariffPercent")
+    latest_year = w.get("latestYear")
+    partner_names = list(w.get("partnerCandidateNames") or [])
+    confidence = str(w.get("confidence") or "low").strip().lower()
+    critical_components = list(w.get("criticalComponents") or [])
+    targeted_level = str(w.get("targetedMatchLevel") or "").strip()
+
+    has_tariff = latest_tariff is not None and latest_year is not None
+    if has_tariff:
+        summary = (
+            f"WTO evidence was found for the product class behind {category}: "
+            f"{hs_label}{f' (HS {hs_code})' if hs_code and hs_code != 'default' else ''}. "
+            f"The latest MFN tariff reading is {latest_tariff}% in {latest_year}. "
+            f"This is product-class evidence rather than brand-specific New Balance trade data."
+        )
+        key_signals = [
+            f"HS-targeted WTO evidence points to {hs_label}{f' (HS {hs_code})' if hs_code and hs_code != 'default' else ''}.",
+            f"Latest MFN tariff is {latest_tariff}% in {latest_year}.",
+            (
+                f"Likely supplier-country candidates are {', '.join(partner_names[:3])}."
+                if partner_names
+                else "Partner-country evidence is limited, so tariff context is stronger than supplier-specific trade flow evidence."
+            ),
+        ]
+        if critical_components:
+            key_signals.append(f"Critical components/material cues include {', '.join(critical_components[:4])}.")
+        data_gaps = [
+            "WTO evidence is product-class and tariff-focused, not brand-specific shipment data.",
+            "Supplier concentration and component-level trade flows remain only partially observed.",
+        ]
+        recommendation = (
+            "Use this WTO evidence as a supply-side risk proxy for the footwear class, and combine it with pricing and sourcing signals rather than waiting for brand-specific trade records."
+        )
+        return {
+            "role": "WTO Trade Evidence Agent",
+            "tradeConstraintSummary": summary,
+            "confidence": confidence or "medium",
+            "keySignals": key_signals[:5],
+            "dataGaps": data_gaps[:4],
+            "recommendation": recommendation,
+        }
+
+    return {
+        "role": "WTO Trade Evidence Agent",
+        "tradeConstraintSummary": "Trade/tariff evidence was limited or unavailable for this category.",
+        "confidence": confidence or "low",
+        "keySignals": [
+            "WTO evidence did not produce a strong targeted trade-constraint signal.",
+            "Any tariff interpretation should be treated as directional only.",
+        ],
+        "dataGaps": [
+            "Partner-specific trade flow evidence was limited.",
+            f"HS-level targeting{f' ({targeted_level})' if targeted_level else ''} may still be broad rather than supplier-specific.",
+        ],
+        "recommendation": "Treat trade exposure as a monitoring item and gather more targeted HS/partner evidence before relying on it heavily.",
     }
 
 
@@ -2070,6 +2564,199 @@ def _summarize_tool_result_for_agent(tool_name: str, result: object, error: str 
             "summary": f"weeklyPoints={len(result)} latest={result[-3:] if result else []}",
         }
     return {"tool": tool_name, "status": "ok", "summary": str(result)[:500]}
+
+
+async def _run_specialist_agents(
+    category: str,
+    *,
+    api_key: str,
+    model: str,
+    live_context: dict,
+    agent_trace: dict,
+) -> dict:
+    tool_plan = list(agent_trace.get("toolPlan") or [])
+    tool_runs = list(agent_trace.get("toolRuns") or [])
+    wto_trade = live_context.get("wtoTrade")
+
+    demand_context = {
+        "news": live_context.get("news"),
+        "trends": live_context.get("trends"),
+        "computedTrendTimeline": live_context.get("computedTrendTimeline"),
+        "toolPlan": [t for t in tool_plan if t in ("news", "trends")],
+        "toolRuns": [r for r in tool_runs if str((r or {}).get("tool") or "") in ("news", "trends")],
+    }
+    market_context = {
+        "ebayPricing": live_context.get("ebayPricing"),
+        "ebayMap": live_context.get("ebayMap"),
+        "wtoTrade": wto_trade,
+        "storedPricingHistoryWeekly": live_context.get("storedPricingHistoryWeekly"),
+        "computedPricingModel": live_context.get("computedPricingModel"),
+        "toolPlan": [t for t in tool_plan if t in ("ebay_pricing", "ebay_map", "wto_trade", "pricing_history")],
+        "toolRuns": [
+            r
+            for r in tool_runs
+            if str((r or {}).get("tool") or "") in ("ebay_pricing", "ebay_map", "wto_trade", "pricing_history")
+        ],
+    }
+
+    trade_system_prompt = (
+        "You are the WTO Trade Evidence Agent in a market-intel team. "
+        "Your job is to convert raw WTO tariff/trade lookup data into a concise supply-side evidence summary. "
+        "Be explicit about what was found, what confidence it deserves, and what gaps still remain. "
+        "Treat WTO results as product-class trade evidence, not brand-specific trade records. "
+        "If the payload contains an HS category, HS code, tariff level, inferred components, or partner candidates, use them directly instead of claiming no trade data exists. "
+        "Do not invent country-specific facts that are not present in the evidence."
+    )
+    trade_user_messages = [
+        f"Category: {category}",
+        "Raw WTO trade context JSON:\n" + json.dumps(wto_trade, ensure_ascii=True),
+        (
+            "Summarize this for a downstream market-constraints analyst. "
+            "Emphasize likely tariff pressure, HS-code specificity, partner/supplier evidence, inferred critical components, and any important data gaps. "
+            "Do not say 'no data for New Balance' when there is product-class footwear evidence in the payload."
+        ),
+    ]
+    trade_task = _openai_structured_json(
+        api_key=api_key,
+        model=model,
+        system_prompt=trade_system_prompt,
+        user_messages=trade_user_messages,
+        schema_name="trade_evidence_agent",
+        schema=_trade_evidence_schema(),
+        max_output_tokens=400,
+    )
+    trade_debug = {
+        "provider": "openai",
+        "model": model,
+    }
+
+    demand_task = _openai_structured_json(
+        api_key=api_key,
+        model=model,
+        system_prompt=(
+            "You are the Demand Specialist in a market-intel agent team. "
+            "Focus on demand, momentum, seasonality, and consumer attention. "
+            "Use only the supplied evidence. Be concise and decision-oriented."
+        ),
+        user_messages=[
+            f"Category: {category}",
+            "Demand evidence JSON:\n" + json.dumps(demand_context, ensure_ascii=True),
+        ],
+        schema_name="demand_specialist",
+        schema=_specialist_analysis_schema(),
+        max_output_tokens=450,
+    )
+
+    demand_result, trade_result = await asyncio.gather(demand_task, trade_task)
+
+    trade_summary_text = str((trade_result or {}).get("tradeConstraintSummary") or "").lower()
+    trade_key_signals_text = " ".join(str(x or "") for x in ((trade_result or {}).get("keySignals") or [])).lower()
+    if (
+        not isinstance(trade_result, dict)
+        or (
+            isinstance(wto_trade, dict)
+            and wto_trade.get("latestTariffPercent") is not None
+            and (
+                "no wto" in trade_summary_text
+                or "no hs code" in trade_summary_text
+                or "no partner" in trade_summary_text
+                or "no hs code" in trade_key_signals_text
+                or "no partner" in trade_key_signals_text
+                or str((trade_result or {}).get("confidence") or "").strip().lower().startswith("low")
+            )
+        )
+    ):
+        trade_result = _fallback_trade_evidence_summary(category, wto_trade)
+
+    market_context["tradeConstraintSummary"] = trade_result
+
+    market_task = None
+    market_debug = {
+        "enabled": bool(ANTHROPIC_API_KEY),
+        "model": ANTHROPIC_MODEL,
+        "keySource": (
+            "ANTHROPIC_API_KEY"
+            if os.getenv("ANTHROPIC_API_KEY")
+            else "CLAUDE_API_KEY"
+            if os.getenv("CLAUDE_API_KEY")
+            else "Calude"
+            if os.getenv("Calude")
+            else "missing"
+        ),
+    }
+    if ANTHROPIC_API_KEY:
+        market_task = _anthropic_structured_json(
+            api_key=ANTHROPIC_API_KEY,
+            model=ANTHROPIC_MODEL,
+            system_prompt=(
+                "You are the Market Constraints Specialist in a market-intel agent team. "
+                "Focus on price positioning, supply-side pressure, trade exposure, and competitive constraints. "
+                "Use only the supplied evidence. Be concise and decision-oriented."
+            ),
+            user_messages=[
+                f"Category: {category}",
+                "Trade evidence agent JSON:\n" + json.dumps(trade_result, ensure_ascii=True),
+                "Market evidence JSON:\n" + json.dumps(market_context, ensure_ascii=True),
+            ],
+            schema_hint=_specialist_analysis_schema(),
+            max_tokens=900,
+        )
+
+    market_result = await (market_task if market_task is not None else asyncio.sleep(0, result=None))
+
+    if not isinstance(demand_result, dict):
+        demand_result = {
+            "role": "Demand Specialist",
+            "thesis": "Demand-specialist analysis unavailable.",
+            "confidence": "low",
+            "keySignals": ["Demand specialist could not complete analysis."],
+            "risks": ["Demand view missing."],
+            "recommendation": "Treat demand-side interpretation as incomplete.",
+        }
+    if not isinstance(market_result, dict):
+        market_result = {
+            "role": "Market Constraints Specialist",
+            "thesis": "Market-constraints analysis unavailable.",
+            "confidence": "low",
+            "keySignals": ["Market specialist could not complete analysis."],
+            "risks": ["Pricing/trade-side view missing."],
+            "recommendation": "Treat market-side interpretation as incomplete.",
+        }
+
+    synthesis = await _openai_structured_json(
+        api_key=api_key,
+        model=model,
+        system_prompt=(
+            "You are the final synthesizer in a multi-agent market-intel team. "
+            "Reconcile the specialist views into one combined assessment. "
+            "Call out where they agree, where they pull in different directions, and what the best practical action is."
+        ),
+        user_messages=[
+            f"Category: {category}",
+            "Demand specialist JSON:\n" + json.dumps(demand_result, ensure_ascii=True),
+            "Trade evidence agent JSON:\n" + json.dumps(trade_result, ensure_ascii=True),
+            "Market specialist JSON:\n" + json.dumps(market_result, ensure_ascii=True),
+        ],
+        schema_name="multi_agent_synthesis",
+        schema=_multi_agent_synthesis_schema(),
+        max_output_tokens=400,
+    )
+
+    synthesis_source = "model"
+    if not isinstance(synthesis, dict):
+        synthesis = _fallback_specialist_synthesis(demand_result, market_result)
+        synthesis_source = "fallback"
+
+    return {
+        "mode": "specialist-synthesis",
+        "demandSpecialist": demand_result,
+        "tradeEvidenceAgent": trade_result,
+        "tradeEvidenceAgentDebug": trade_debug,
+        "marketSpecialist": market_result,
+        "synthesis": synthesis,
+        "synthesisDebug": {"source": synthesis_source},
+        "marketDebug": market_debug,
+    }
 
 
 async def _build_agentic_live_context(
@@ -2347,105 +3034,162 @@ def _arima_robustness(values: list, horizon_weeks: int = 52) -> dict | None:
         if len(train_series) < 24 or len(test_series) < 4:
             return None
 
-        diff_train = [train_series[i] - train_series[i - 1] for i in range(1, len(train_series))]
-        if len(diff_train) < 20:
-            return None
-
-        # d=1 via explicit differencing; this is equivalent to reporting ARIMA(1,1,1) on levels.
-        fitted = ARIMA(
-            diff_train,
-            order=(1, 0, 1),
-            enforce_stationarity=False,
-            enforce_invertibility=False,
-        ).fit()
-
-        holdout_diff_forecast = fitted.forecast(steps=holdout_weeks)
-        holdout_diffs = [float(v) for v in holdout_diff_forecast]
-        holdout_level_pred = []
-        running = float(train_series[-1])
-        for dv in holdout_diffs:
-            running += dv
-            holdout_level_pred.append(running)
-
         naive_last_pred = [float(train_series[-1])] * holdout_weeks
         trailing_mean = sum(train_series[-min(8, len(train_series)):]) / min(8, len(train_series))
         mean_pred = [float(trailing_mean)] * holdout_weeks
-
-        mae_arima = _mae(test_series, holdout_level_pred)
-        rmse_arima = _rmse(test_series, holdout_level_pred)
         mae_naive = _mae(test_series, naive_last_pred)
         rmse_naive = _rmse(test_series, naive_last_pred)
         mae_mean = _mae(test_series, mean_pred)
         rmse_mean = _rmse(test_series, mean_pred)
 
-        forecast_diff = fitted.forecast(steps=max(4, int(horizon_weeks)))
-        level_forecast = []
-        running = float(series[-1])
-        for dv in [float(v) for v in forecast_diff]:
-            running += dv
-            level_forecast.append(running)
-        if not level_forecast:
-            return None
+        def _difference(vals: list[float], order: int) -> list[float]:
+            out = list(vals)
+            for _ in range(max(0, int(order))):
+                out = [out[i] - out[i - 1] for i in range(1, len(out))]
+                if len(out) < 3:
+                    break
+            return out
 
-        avg_fc = sum(level_forecast) / len(level_forecast)
-        clipped_upper = avg_fc > 100.0
-        clipped_lower = avg_fc < 0.0
-        residuals = []
-        for r in fitted.resid:
+        candidate_orders = [
+            (0, 1, 1),
+            (1, 1, 0),
+            (1, 1, 1),
+            (2, 1, 0),
+            (0, 1, 2),
+            (2, 1, 1),
+            (1, 1, 2),
+            (2, 1, 2),
+            (0, 2, 1),
+            (1, 2, 0),
+            (1, 2, 1),
+            (0, 0, 1),
+            (1, 0, 0),
+            (1, 0, 1),
+        ]
+
+        candidates = []
+        for p, d, q in candidate_orders:
+            if len(train_series) <= max(18, holdout_weeks + d + p + q):
+                continue
             try:
-                fr = float(r)
+                fitted = ARIMA(
+                    train_series,
+                    order=(p, d, q),
+                    enforce_stationarity=False,
+                    enforce_invertibility=False,
+                ).fit()
+
+                holdout_forecast = fitted.forecast(steps=holdout_weeks)
+                holdout_level_pred = [float(v) for v in holdout_forecast]
+                if len(holdout_level_pred) != holdout_weeks:
+                    continue
+
+                mae_arima = _mae(test_series, holdout_level_pred)
+                rmse_arima = _rmse(test_series, holdout_level_pred)
+
+                future_forecast = fitted.forecast(steps=max(4, int(horizon_weeks)))
+                level_forecast = [float(v) for v in future_forecast]
+                if not level_forecast:
+                    continue
+
+                avg_fc = sum(level_forecast) / len(level_forecast)
+                clipped_upper = avg_fc > 100.0
+                clipped_lower = avg_fc < 0.0
+
+                residuals = []
+                fitted_residuals = getattr(fitted, "resid", None)
+                if fitted_residuals is None:
+                    fitted_residuals = []
+                for r in fitted_residuals:
+                    try:
+                        fr = float(r)
+                    except Exception:
+                        continue
+                    if math.isfinite(fr):
+                        residuals.append(fr)
+
+                diff_train = _difference(train_series, d)
+                adf_stat = None
+                adf_pvalue = None
+                try:
+                    if len(diff_train) >= 8:
+                        adf_res = adfuller(diff_train)
+                        adf_stat = float(adf_res[0])
+                        adf_pvalue = float(adf_res[1])
+                except Exception:
+                    pass
+
+                lb_pvalue = None
+                try:
+                    if len(residuals) >= 8:
+                        lb_lag = min(10, max(3, len(residuals) // 8))
+                        lb = acorr_ljungbox(residuals, lags=[lb_lag], return_df=True)
+                        lb_pvalue = float(lb["lb_pvalue"].iloc[-1])
+                except Exception:
+                    pass
+
+                residual_mean = sum(residuals) / len(residuals) if residuals else 0.0
+                beats_naive = rmse_arima <= rmse_naive if rmse_naive > 0 else True
+                beats_mean = rmse_arima <= rmse_mean if rmse_mean > 0 else True
+
+                candidate = {
+                    "futureScore": _clip_0_100(avg_fc),
+                    "unclippedFutureScore": round(float(avg_fc), 3),
+                    "clippedUpper": bool(clipped_upper),
+                    "clippedLower": bool(clipped_lower),
+                    "modelOrder": f"ARIMA({p},{d},{q})",
+                    "estimationOrder": f"ARIMA({p},{d},{q}) on level series",
+                    "differenceOrder": d,
+                    "trainingPoints": len(train_series),
+                    "holdoutPoints": len(test_series),
+                    "forecastHorizonWeeks": int(horizon_weeks),
+                    "adfStatistic": round(adf_stat, 4) if adf_stat is not None else None,
+                    "adfPValue": round(adf_pvalue, 4) if adf_pvalue is not None else None,
+                    "aic": round(float(fitted.aic), 2) if hasattr(fitted, "aic") else None,
+                    "bic": round(float(fitted.bic), 2) if hasattr(fitted, "bic") else None,
+                    "residualMean": round(float(residual_mean), 4),
+                    "ljungBoxPValue": round(lb_pvalue, 4) if lb_pvalue is not None else None,
+                    "holdoutMAE": round(float(mae_arima), 3),
+                    "holdoutRMSE": round(float(rmse_arima), 3),
+                    "naiveMAE": round(float(mae_naive), 3),
+                    "naiveRMSE": round(float(rmse_naive), 3),
+                    "rollingMeanMAE": round(float(mae_mean), 3),
+                    "rollingMeanRMSE": round(float(rmse_mean), 3),
+                    "beatsNaive": bool(beats_naive),
+                    "beatsRollingMean": bool(beats_mean),
+                }
+                candidate["_rank"] = (
+                    float(rmse_arima),
+                    0 if beats_naive else 1,
+                    0 if beats_mean else 1,
+                    0 if lb_pvalue is not None and lb_pvalue > 0.05 else 1,
+                    0 if adf_pvalue is not None and adf_pvalue < 0.05 else 1,
+                    float(candidate["aic"]) if candidate["aic"] is not None else float("inf"),
+                )
+                candidates.append(candidate)
             except Exception:
                 continue
-            if math.isfinite(fr):
-                residuals.append(fr)
 
-        adf_stat = None
-        adf_pvalue = None
-        try:
-            adf_res = adfuller(diff_train)
-            adf_stat = float(adf_res[0])
-            adf_pvalue = float(adf_res[1])
-        except Exception:
-            pass
+        if not candidates:
+            return None
 
-        lb_pvalue = None
-        try:
-            lb_lag = min(10, max(3, len(residuals) // 8))
-            lb = acorr_ljungbox(residuals, lags=[lb_lag], return_df=True)
-            lb_pvalue = float(lb["lb_pvalue"].iloc[-1])
-        except Exception:
-            pass
-
-        residual_mean = sum(residuals) / len(residuals) if residuals else 0.0
-        beats_naive = rmse_arima <= rmse_naive if rmse_naive > 0 else True
-        beats_mean = rmse_arima <= rmse_mean if rmse_mean > 0 else True
-
-        return {
-            "futureScore": _clip_0_100(avg_fc),
-            "unclippedFutureScore": round(float(avg_fc), 3),
-            "clippedUpper": bool(clipped_upper),
-            "clippedLower": bool(clipped_lower),
-            "modelOrder": "ARIMA(1,1,1)",
-            "estimationOrder": "ARIMA(1,0,1) on differenced series",
-            "differenceOrder": 1,
-            "trainingPoints": len(train_series),
-            "holdoutPoints": len(test_series),
-            "forecastHorizonWeeks": int(horizon_weeks),
-            "adfStatistic": round(adf_stat, 4) if adf_stat is not None else None,
-            "adfPValue": round(adf_pvalue, 4) if adf_pvalue is not None else None,
-            "aic": round(float(fitted.aic), 2) if hasattr(fitted, "aic") else None,
-            "bic": round(float(fitted.bic), 2) if hasattr(fitted, "bic") else None,
-            "residualMean": round(float(residual_mean), 4),
-            "ljungBoxPValue": round(lb_pvalue, 4) if lb_pvalue is not None else None,
-            "holdoutMAE": round(float(mae_arima), 3),
-            "holdoutRMSE": round(float(rmse_arima), 3),
-            "naiveMAE": round(float(mae_naive), 3),
-            "naiveRMSE": round(float(rmse_naive), 3),
-            "rollingMeanMAE": round(float(mae_mean), 3),
-            "rollingMeanRMSE": round(float(rmse_mean), 3),
-            "beatsNaive": bool(beats_naive),
-            "beatsRollingMean": bool(beats_mean),
-        }
+        ranked = sorted(candidates, key=lambda c: c.get("_rank", (float("inf"),)))
+        best = dict(ranked[0])
+        best.pop("_rank", None)
+        best["selectionMethod"] = f"lowest holdout RMSE across {len(ranked)} candidate ARIMA specifications"
+        best["candidateCount"] = len(ranked)
+        best["testedModels"] = [
+            {
+                "modelOrder": c.get("modelOrder"),
+                "holdoutRMSE": c.get("holdoutRMSE"),
+                "adfPValue": c.get("adfPValue"),
+                "ljungBoxPValue": c.get("ljungBoxPValue"),
+                "beatsNaive": c.get("beatsNaive"),
+                "beatsRollingMean": c.get("beatsRollingMean"),
+            }
+            for c in ranked[:5]
+        ]
+        return best
     except Exception:
         return None
 
@@ -2693,6 +3437,14 @@ async def analyze(request: Request):
         wto_strict_targeted=wto_strict_targeted,
         user_objective=f"Produce a grounded market intelligence report for {category}.",
     )
+    specialist_trace = await _run_specialist_agents(
+        category,
+        api_key=api_key,
+        model=model,
+        live_context=live_context,
+        agent_trace=agent_trace,
+    )
+    agent_trace["specialists"] = specialist_trace
 
     current_year = datetime.utcnow().year
     past_year = current_year - 1
@@ -2715,6 +3467,7 @@ Guidance:
 - Use every available live/computed context section to ground scores and narrative.
 - Explicitly reference specialized tool signals where relevant (NewsAPI, Google Trends, eBay pricing/map, WTO trade context).
 - You are operating after an agent planning loop. Use the plan and tool evidence to explain what mattered most.
+- A demand specialist and a market-constraints specialist have already reviewed the evidence. Use their synthesis where helpful.
 - You may use general model knowledge for context not present in tools, but do not invent specific live facts.
 """
 
@@ -2730,6 +3483,10 @@ Guidance:
             {
                 "role": "user",
                 "content": "Agent trace JSON:\n" + json.dumps(agent_trace, ensure_ascii=True),
+            },
+            {
+                "role": "user",
+                "content": "Specialist analysis JSON:\n" + json.dumps(specialist_trace, ensure_ascii=True),
             },
         ],
         # Structured Outputs (Responses API uses text.format)
@@ -2894,6 +3651,7 @@ async def chat_followup(request: Request):
 
     live_context = None
     agent_trace = None
+    specialist_trace = None
     if category:
         live_context, agent_trace = await _build_agentic_live_context(
             category,
@@ -2904,12 +3662,21 @@ async def chat_followup(request: Request):
             wto_strict_targeted=wto_strict_targeted,
             user_objective=question,
         )
+        specialist_trace = await _run_specialist_agents(
+            category,
+            api_key=api_key,
+            model=model,
+            live_context=live_context,
+            agent_trace=agent_trace,
+        )
+        agent_trace["specialists"] = specialist_trace
 
     context_payload = {
         "category": category,
         "report": report if isinstance(report, dict) else None,
         "liveContext": live_context,
         "agentTrace": agent_trace,
+        "specialistTrace": specialist_trace,
     }
 
     input_msgs = [
@@ -2919,6 +3686,7 @@ async def chat_followup(request: Request):
                 "You are TrendPulse Follow-up Assistant. "
                 "Use a hybrid approach: prioritize provided report/tool context, and supplement with general model knowledge when needed. "
                 "When live tool context is present, use it for pricing, demand, and tariff/trade-policy portions of the answer. "
+                "When specialist analyses are present, use them as intermediate reasoning products rather than ignoring them. "
                 "Always structure the response with these exact headings: "
                 "'From Report/Tools', 'From General Knowledge', and 'Combined Implication'. "
                 "If a section has no content, write 'None'. "
