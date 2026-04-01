@@ -2313,11 +2313,28 @@ def _specialist_analysis_schema() -> dict:
     return {
         "type": "object",
         "additionalProperties": False,
-        "required": ["role", "thesis", "confidence", "keySignals", "risks", "recommendation"],
+        "required": [
+            "role",
+            "thesis",
+            "confidence",
+            "mostImportantSignal",
+            "whatItMeans",
+            "industryContext",
+            "decisionImpact",
+            "mainUncertainty",
+            "keySignals",
+            "risks",
+            "recommendation",
+        ],
         "properties": {
             "role": {"type": "string"},
             "thesis": {"type": "string"},
             "confidence": {"type": "string"},
+            "mostImportantSignal": {"type": "string"},
+            "whatItMeans": {"type": "string"},
+            "industryContext": {"type": "string"},
+            "decisionImpact": {"type": "string"},
+            "mainUncertainty": {"type": "string"},
             "keySignals": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 5},
             "risks": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 4},
             "recommendation": {"type": "string"},
@@ -2333,6 +2350,11 @@ def _trade_evidence_schema() -> dict:
             "role",
             "tradeConstraintSummary",
             "confidence",
+            "mostImportantSignal",
+            "whatItMeans",
+            "industryContext",
+            "decisionImpact",
+            "mainUncertainty",
             "keySignals",
             "dataGaps",
             "recommendation",
@@ -2341,6 +2363,11 @@ def _trade_evidence_schema() -> dict:
             "role": {"type": "string"},
             "tradeConstraintSummary": {"type": "string"},
             "confidence": {"type": "string"},
+            "mostImportantSignal": {"type": "string"},
+            "whatItMeans": {"type": "string"},
+            "industryContext": {"type": "string"},
+            "decisionImpact": {"type": "string"},
+            "mainUncertainty": {"type": "string"},
             "keySignals": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 5},
             "dataGaps": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 4},
             "recommendation": {"type": "string"},
@@ -2448,6 +2475,21 @@ def _fallback_trade_evidence_summary(category: str, wto_trade: dict | None) -> d
             "role": "WTO Trade Evidence Agent",
             "tradeConstraintSummary": summary,
             "confidence": confidence or "medium",
+            "mostImportantSignal": (
+                f"The strongest supply-side signal is the {latest_tariff}% MFN tariff on {hs_label} in {latest_year}."
+            ),
+            "whatItMeans": (
+                "Trade evidence should be interpreted at the product-class level, which is still useful for margin and sourcing analysis even without brand-specific customs records."
+            ),
+            "industryContext": (
+                "In footwear, trade exposure often sits at the product-class level because brands source across common manufacturing hubs such as Vietnam, China, and Indonesia rather than brand-exclusive tariff channels."
+            ),
+            "decisionImpact": (
+                "Treat footwear tariff exposure as a real constraint signal when judging sourcing flexibility, margin durability, and pricing power."
+            ),
+            "mainUncertainty": (
+                "The evidence does not show brand-specific supplier concentration or exact country-of-origin mix."
+            ),
             "keySignals": key_signals[:5],
             "dataGaps": data_gaps[:4],
             "recommendation": recommendation,
@@ -2457,6 +2499,11 @@ def _fallback_trade_evidence_summary(category: str, wto_trade: dict | None) -> d
         "role": "WTO Trade Evidence Agent",
         "tradeConstraintSummary": "Trade/tariff evidence was limited or unavailable for this category.",
         "confidence": confidence or "low",
+        "mostImportantSignal": "The WTO lookup did not yield a strong targeted trade signal.",
+        "whatItMeans": "Trade-side evidence is too thin to support a confident supply-chain or tariff interpretation.",
+        "industryContext": "Footwear supply chains are often globally distributed, so limited HS and partner specificity makes trade risk hard to quantify even when general industry patterns are known.",
+        "decisionImpact": "Keep trade exposure as a monitoring factor rather than a primary decision driver.",
+        "mainUncertainty": "HS specificity, supplier-country concentration, and component-level exposure remain unclear.",
         "keySignals": [
             "WTO evidence did not produce a strong targeted trade-constraint signal.",
             "Any tariff interpretation should be treated as directional only.",
@@ -2600,19 +2647,23 @@ async def _run_specialist_agents(
     }
 
     trade_system_prompt = (
-        "You are the WTO Trade Evidence Agent in a market-intel team. "
-        "Your job is to convert raw WTO tariff/trade lookup data into a concise supply-side evidence summary. "
+        "You are a senior trade analyst serving as the WTO Trade Evidence Agent in a market-intel team. "
+        "Your job is to convert raw WTO tariff/trade lookup data into a concise supply-side analysis, not a tool recap. "
+        "Lead with the most decision-relevant signal, explain what it means, and state how it should affect a sourcing or pricing decision. "
         "Be explicit about what was found, what confidence it deserves, and what gaps still remain. "
+        "You may use broad industry knowledge from your general training to add product-class trade context, but you must clearly ground the analysis in the supplied evidence and avoid inventing precise unsupported facts. "
         "Treat WTO results as product-class trade evidence, not brand-specific trade records. "
         "If the payload contains an HS category, HS code, tariff level, inferred components, or partner candidates, use them directly instead of claiming no trade data exists. "
-        "Do not invent country-specific facts that are not present in the evidence."
+        "Do not narrate each field one by one, and do not invent country-specific facts that are not present in the evidence."
     )
     trade_user_messages = [
         f"Category: {category}",
         "Raw WTO trade context JSON:\n" + json.dumps(wto_trade, ensure_ascii=True),
         (
-            "Summarize this for a downstream market-constraints analyst. "
+            "Analyze this for a downstream market-constraints analyst. "
             "Emphasize likely tariff pressure, HS-code specificity, partner/supplier evidence, inferred critical components, and any important data gaps. "
+            "Do not summarize each field mechanically; synthesize what the evidence implies. "
+            "Include 1-2 sentences of industry context from your general knowledge about how this product class is usually sourced, traded, or exposed to tariffs. "
             "Do not say 'no data for New Balance' when there is product-class footwear evidence in the payload."
         ),
     ]
@@ -2634,9 +2685,12 @@ async def _run_specialist_agents(
         api_key=api_key,
         model=model,
         system_prompt=(
-            "You are the Demand Specialist in a market-intel agent team. "
+            "You are a senior demand analyst in a market-intel agent team. "
             "Focus on demand, momentum, seasonality, and consumer attention. "
-            "Use only the supplied evidence. Be concise and decision-oriented."
+            "Do not restate the tools one by one. Instead, identify the strongest demand signal, explain what it means, "
+            "state the decision impact, and name the biggest uncertainty. "
+            "You must include 1-2 sentences of broader industry context from your general training about brand positioning, audience, or consumer behavior. Clearly distinguish direct evidence from industry-informed inference and do not invent precise unsupported statistics. "
+            "Be concise and decision-oriented."
         ),
         user_messages=[
             f"Category: {category}",
@@ -2674,6 +2728,7 @@ async def _run_specialist_agents(
     market_debug = {
         "enabled": bool(ANTHROPIC_API_KEY),
         "model": ANTHROPIC_MODEL,
+        "provider": "anthropic" if ANTHROPIC_API_KEY else "openai-fallback",
         "keySource": (
             "ANTHROPIC_API_KEY"
             if os.getenv("ANTHROPIC_API_KEY")
@@ -2689,9 +2744,12 @@ async def _run_specialist_agents(
             api_key=ANTHROPIC_API_KEY,
             model=ANTHROPIC_MODEL,
             system_prompt=(
-                "You are the Market Constraints Specialist in a market-intel agent team. "
+                "You are a senior market constraints analyst in a market-intel agent team. "
                 "Focus on price positioning, supply-side pressure, trade exposure, and competitive constraints. "
-                "Use only the supplied evidence. Be concise and decision-oriented."
+                "Do not restate evidence source by source. Identify the strongest constraint signal, explain what it means, "
+                "state the decision impact, and name the biggest uncertainty. "
+                "You must include 1-2 sentences of broader industry context from your general training about category structure, brand positioning, likely competitive dynamics, or sourcing patterns. Clearly distinguish direct evidence from industry-informed inference and do not invent precise unsupported statistics. "
+                "Be concise and decision-oriented."
             ),
             user_messages=[
                 f"Category: {category}",
@@ -2701,14 +2759,66 @@ async def _run_specialist_agents(
             schema_hint=_specialist_analysis_schema(),
             max_tokens=900,
         )
+    else:
+        market_task = _openai_structured_json(
+            api_key=api_key,
+            model=model,
+            system_prompt=(
+                "You are a senior market constraints analyst in a market-intel agent team. "
+                "Focus on price positioning, supply-side pressure, trade exposure, and competitive constraints. "
+                "Do not restate evidence source by source. Identify the strongest constraint signal, explain what it means, "
+                "state the decision impact, and name the biggest uncertainty. "
+                "You must include 1-2 sentences of broader industry context from your general training about category structure, brand positioning, likely competitive dynamics, or sourcing patterns. Clearly distinguish direct evidence from industry-informed inference and do not invent precise unsupported statistics. "
+                "Be concise and decision-oriented."
+            ),
+            user_messages=[
+                f"Category: {category}",
+                "Trade evidence agent JSON:\n" + json.dumps(trade_result, ensure_ascii=True),
+                "Market evidence JSON:\n" + json.dumps(market_context, ensure_ascii=True),
+            ],
+            schema_name="market_constraints_specialist",
+            schema=_specialist_analysis_schema(),
+            max_output_tokens=500,
+        )
 
     market_result = await (market_task if market_task is not None else asyncio.sleep(0, result=None))
+
+    if not isinstance(market_result, dict):
+        market_debug["fallbackUsed"] = "openai"
+        market_result = await _openai_structured_json(
+            api_key=api_key,
+            model=model,
+            system_prompt=(
+                "You are a senior market constraints analyst in a market-intel agent team. "
+                "Focus on price positioning, supply-side pressure, trade exposure, and competitive constraints. "
+                "Do not restate evidence source by source. Identify the strongest constraint signal, explain what it means, "
+                "state the decision impact, and name the biggest uncertainty. "
+                "You must include 1-2 sentences of broader industry context from your general training about category structure, brand positioning, likely competitive dynamics, or sourcing patterns. Clearly distinguish direct evidence from industry-informed inference and do not invent precise unsupported statistics. "
+                "Be concise and decision-oriented."
+            ),
+            user_messages=[
+                f"Category: {category}",
+                "Trade evidence agent JSON:\n" + json.dumps(trade_result, ensure_ascii=True),
+                "Market evidence JSON:\n" + json.dumps(market_context, ensure_ascii=True),
+            ],
+            schema_name="market_constraints_specialist_fallback",
+            schema=_specialist_analysis_schema(),
+            max_output_tokens=500,
+        )
+        if isinstance(market_result, dict):
+            market_debug["provider"] = "openai-fallback"
+            market_debug["model"] = model
 
     if not isinstance(demand_result, dict):
         demand_result = {
             "role": "Demand Specialist",
             "thesis": "Demand-specialist analysis unavailable.",
             "confidence": "low",
+            "mostImportantSignal": "Demand analyst could not identify a reliable primary signal.",
+            "whatItMeans": "Demand-side interpretation is incomplete.",
+            "industryContext": "Running-shoe demand usually reflects both performance use and lifestyle crossover, but that broader context could not be connected confidently to the supplied evidence here.",
+            "decisionImpact": "Avoid over-weighting demand momentum in the recommendation.",
+            "mainUncertainty": "The key consumer-behavior driver was not resolved.",
             "keySignals": ["Demand specialist could not complete analysis."],
             "risks": ["Demand view missing."],
             "recommendation": "Treat demand-side interpretation as incomplete.",
@@ -2718,6 +2828,11 @@ async def _run_specialist_agents(
             "role": "Market Constraints Specialist",
             "thesis": "Market-constraints analysis unavailable.",
             "confidence": "low",
+            "mostImportantSignal": "Market specialist could not determine a reliable primary constraint signal.",
+            "whatItMeans": "The supply-side and pricing interpretation is incomplete.",
+            "industryContext": "Running-shoe markets are often shaped by mid-tier price competition, sourcing concentration, and brand positioning, but those context clues were not resolved into a reliable conclusion here.",
+            "decisionImpact": "Avoid over-weighting pricing or trade constraints in the recommendation.",
+            "mainUncertainty": "The main constraint on margins or pricing power was not resolved.",
             "keySignals": ["Market specialist could not complete analysis."],
             "risks": ["Pricing/trade-side view missing."],
             "recommendation": "Treat market-side interpretation as incomplete.",
@@ -2727,9 +2842,10 @@ async def _run_specialist_agents(
         api_key=api_key,
         model=model,
         system_prompt=(
-            "You are the final synthesizer in a multi-agent market-intel team. "
+            "You are the lead analyst and final synthesizer in a multi-agent market-intel team. "
             "Reconcile the specialist views into one combined assessment. "
-            "Call out where they agree, where they pull in different directions, and what the best practical action is."
+            "Do not merely concatenate tool findings. Explain where they agree, where they pull in different directions, and what the best practical action is. "
+            "You may use broad industry knowledge from your general training to frame category and brand context, but clearly separate supplied evidence from industry-informed inference and do not invent precise unsupported statistics."
         ),
         user_messages=[
             f"Category: {category}",
@@ -3157,15 +3273,9 @@ def _arima_robustness(values: list, horizon_weeks: int = 52) -> dict | None:
                     "rollingMeanRMSE": round(float(rmse_mean), 3),
                     "beatsNaive": bool(beats_naive),
                     "beatsRollingMean": bool(beats_mean),
+                    "rejectsNonstationarity": bool(adf_pvalue is not None and adf_pvalue < 0.05),
+                    "passesResidualCheck": bool(lb_pvalue is not None and lb_pvalue > 0.05),
                 }
-                candidate["_rank"] = (
-                    float(rmse_arima),
-                    0 if beats_naive else 1,
-                    0 if beats_mean else 1,
-                    0 if lb_pvalue is not None and lb_pvalue > 0.05 else 1,
-                    0 if adf_pvalue is not None and adf_pvalue < 0.05 else 1,
-                    float(candidate["aic"]) if candidate["aic"] is not None else float("inf"),
-                )
                 candidates.append(candidate)
             except Exception:
                 continue
@@ -3173,21 +3283,64 @@ def _arima_robustness(values: list, horizon_weeks: int = 52) -> dict | None:
         if not candidates:
             return None
 
-        ranked = sorted(candidates, key=lambda c: c.get("_rank", (float("inf"),)))
+        fully_significant_candidates = [
+            c for c in candidates if c.get("rejectsNonstationarity") and c.get("passesResidualCheck")
+        ]
+        stationary_candidates = [c for c in candidates if c.get("rejectsNonstationarity")]
+        if fully_significant_candidates:
+            selection_pool = fully_significant_candidates
+            selection_method = (
+                f"lowest holdout RMSE among {len(selection_pool)} candidate ARIMA specifications "
+                f"that reject nonstationarity and pass the residual autocorrelation check"
+            )
+        elif stationary_candidates:
+            selection_pool = stationary_candidates
+            selection_method = (
+                f"lowest holdout RMSE among {len(selection_pool)} candidate ARIMA specifications "
+                f"that reject nonstationarity"
+            )
+        else:
+            selection_pool = candidates
+            selection_method = (
+                f"lowest holdout RMSE across {len(candidates)} candidate ARIMA specifications "
+                f"(no candidate passed the stationarity gate)"
+            )
+        ranked = sorted(
+            selection_pool,
+            key=lambda c: (
+                float(c.get("holdoutRMSE") if c.get("holdoutRMSE") is not None else float("inf")),
+                0 if c.get("beatsNaive") else 1,
+                0 if c.get("beatsRollingMean") else 1,
+                0 if c.get("passesResidualCheck") else 1,
+                float(c.get("aic")) if c.get("aic") is not None else float("inf"),
+            ),
+        )
         best = dict(ranked[0])
-        best.pop("_rank", None)
-        best["selectionMethod"] = f"lowest holdout RMSE across {len(ranked)} candidate ARIMA specifications"
+        best["selectionMethod"] = selection_method
+        best["stationarityConfirmed"] = bool(best.get("rejectsNonstationarity"))
+        best["residualCheckPassed"] = bool(best.get("passesResidualCheck"))
         best["candidateCount"] = len(ranked)
         best["testedModels"] = [
             {
                 "modelOrder": c.get("modelOrder"),
                 "holdoutRMSE": c.get("holdoutRMSE"),
                 "adfPValue": c.get("adfPValue"),
+                "rejectsNonstationarity": c.get("rejectsNonstationarity"),
                 "ljungBoxPValue": c.get("ljungBoxPValue"),
+                "passesResidualCheck": c.get("passesResidualCheck"),
                 "beatsNaive": c.get("beatsNaive"),
                 "beatsRollingMean": c.get("beatsRollingMean"),
             }
-            for c in ranked[:5]
+            for c in sorted(
+                candidates,
+                key=lambda c: (
+                    0 if c.get("rejectsNonstationarity") and c.get("passesResidualCheck") else 1,
+                    0 if c.get("rejectsNonstationarity") else 1,
+                    float(c.get("holdoutRMSE") if c.get("holdoutRMSE") is not None else float("inf")),
+                    0 if c.get("beatsNaive") else 1,
+                    0 if c.get("beatsRollingMean") else 1,
+                ),
+            )[:5]
         ]
         return best
     except Exception:

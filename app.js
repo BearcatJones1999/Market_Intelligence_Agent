@@ -457,6 +457,45 @@ function renderSpecialistTraceCard(agentTrace, wtoTrade = null) {
     if (!arr.length) return `<div class="specialist-empty">No notable signals recorded.</div>`;
     return arr.map((item) => `<div class="specialist-bullet">${esc(cleanPresentationText(item))}</div>`).join("");
   };
+  const renderAnalystRead = (entry) => {
+    const blocks = [];
+    if (entry?.mostImportantSignal) {
+      blocks.push(
+        `<div class="specialist-section-label">Most Important Signal</div><div class="specialist-note">${esc(
+          cleanPresentationText(entry.mostImportantSignal)
+        )}</div>`
+      );
+    }
+    if (entry?.whatItMeans) {
+      blocks.push(
+        `<div class="specialist-section-label">What It Means</div><div class="specialist-note">${esc(
+          cleanPresentationText(entry.whatItMeans)
+        )}</div>`
+      );
+    }
+    if (entry?.industryContext) {
+      blocks.push(
+        `<div class="specialist-section-label">Industry Context</div><div class="specialist-note">${esc(
+          cleanPresentationText(entry.industryContext)
+        )}</div>`
+      );
+    }
+    if (entry?.decisionImpact) {
+      blocks.push(
+        `<div class="specialist-section-label">Decision Impact</div><div class="specialist-note">${esc(
+          cleanPresentationText(entry.decisionImpact)
+        )}</div>`
+      );
+    }
+    if (entry?.mainUncertainty) {
+      blocks.push(
+        `<div class="specialist-section-label">Main Uncertainty</div><div class="specialist-note">${esc(
+          cleanPresentationText(entry.mainUncertainty)
+        )}</div>`
+      );
+    }
+    return blocks.join("");
+  };
 
   return `<div class="section-card specialist-card" style="margin-bottom:20px">
     <div class="section-heading">Specialist Agents <span class="live-badge" style="font-size:9px">OpenAI + Claude</span></div>
@@ -475,6 +514,7 @@ function renderSpecialistTraceCard(agentTrace, wtoTrade = null) {
           <div class="specialist-confidence">${esc(demandConfidence.label)}</div>
         </div>
         <div class="specialist-thesis">${esc(cleanPresentationText(demand.thesis || "No thesis recorded."))}</div>
+        ${renderAnalystRead(demand)}
         <div class="specialist-section-label">Key signals</div>
         ${renderBulletList(demand.keySignals)}
         <div class="specialist-section-label">Recommendation</div>
@@ -494,6 +534,7 @@ function renderSpecialistTraceCard(agentTrace, wtoTrade = null) {
           <div class="specialist-confidence">${esc(marketConfidence.label)}</div>
         </div>
         <div class="specialist-thesis">${esc(cleanPresentationText(market.thesis || "No thesis recorded."))}</div>
+        ${renderAnalystRead(market)}
         <div class="specialist-section-label">Key signals</div>
         ${renderBulletList(market.keySignals)}
         <div class="specialist-section-label">Recommendation</div>
@@ -513,6 +554,7 @@ function renderSpecialistTraceCard(agentTrace, wtoTrade = null) {
           <div class="specialist-confidence">${esc(tradeConfidence.label)}</div>
         </div>
       <div class="specialist-thesis">${esc(cleanPresentationText(trade.tradeConstraintSummary || "No trade summary recorded."))}</div>
+      ${renderAnalystRead(trade)}
       <div class="specialist-section-label">Key signals</div>
       ${renderBulletList(trade.keySignals)}
       <div class="specialist-section-label">Recommendation</div>
@@ -1737,12 +1779,42 @@ function buildReportHTML(r, n, t, w) {
             )
             .join("");
         };
+        const analystRead = (entry) => {
+          const blocks = [];
+          if (entry?.mostImportantSignal) {
+            blocks.push(
+              `<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#8c897e;margin:10px 0 6px">Most Important Signal</div><div class="report-body" style="font-size:11px">${esc(cleanPresentationText(entry.mostImportantSignal))}</div>`
+            );
+          }
+          if (entry?.whatItMeans) {
+            blocks.push(
+              `<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#8c897e;margin:10px 0 6px">What It Means</div><div class="report-body" style="font-size:11px">${esc(cleanPresentationText(entry.whatItMeans))}</div>`
+            );
+          }
+          if (entry?.industryContext) {
+            blocks.push(
+              `<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#8c897e;margin:10px 0 6px">Industry Context</div><div class="report-body" style="font-size:11px">${esc(cleanPresentationText(entry.industryContext))}</div>`
+            );
+          }
+          if (entry?.decisionImpact) {
+            blocks.push(
+              `<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#8c897e;margin:10px 0 6px">Decision Impact</div><div class="report-body" style="font-size:11px">${esc(cleanPresentationText(entry.decisionImpact))}</div>`
+            );
+          }
+          if (entry?.mainUncertainty) {
+            blocks.push(
+              `<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#8c897e;margin:10px 0 6px">Main Uncertainty</div><div class="report-body" style="font-size:11px">${esc(cleanPresentationText(entry.mainUncertainty))}</div>`
+            );
+          }
+          return blocks.join("");
+        };
         return `<div class="sec-title">Specialist Agents <span class="badge-pill live" style="font-size:8px">OpenAI + Claude</span></div>
   <div class="grid-2" style="margin-bottom:10px">
     <div class="stat" style="border-color:#bfcff8;background:#f8fbff">
       <div class="stat-lbl" style="color:#2563eb">Demand Specialist</div>
       <div class="stat-sub">OpenAI analyst • ${esc(formatConfidenceLabel(demand.confidence || ""))}</div>
       <div class="report-body" style="font-size:11px;margin-top:6px">${esc(cleanPresentationText(demand.thesis || "No thesis recorded."))}</div>
+      ${analystRead(demand)}
       <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#8c897e;margin:10px 0 6px">Key signals</div>
       ${bullets(demand.keySignals)}
       <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#8c897e;margin:10px 0 6px">Recommendation</div>
@@ -1752,6 +1824,7 @@ function buildReportHTML(r, n, t, w) {
       <div class="stat-lbl" style="color:#7c3aed">WTO Trade Evidence Agent</div>
       <div class="stat-sub">${esc(tradeProviderLabel)} • ${esc(formatConfidenceLabel(trade.confidence || ""))}</div>
       <div class="report-body" style="font-size:11px;margin-top:6px">${esc(cleanPresentationText(trade.tradeConstraintSummary || "No trade summary recorded."))}</div>
+      ${analystRead(trade)}
       <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#8c897e;margin:10px 0 6px">Key signals</div>
       ${bullets(trade.keySignals)}
       <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#8c897e;margin:10px 0 6px">Recommendation</div>
@@ -1782,6 +1855,7 @@ function buildReportHTML(r, n, t, w) {
       <div class="stat-lbl" style="color:#0d9488">Market Constraints Specialist</div>
       <div class="stat-sub">Claude analyst • ${esc(formatConfidenceLabel(market.confidence || ""))}</div>
       <div class="report-body" style="font-size:11px;margin-top:6px">${esc(cleanPresentationText(market.thesis || "No thesis recorded."))}</div>
+      ${analystRead(market)}
       <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#8c897e;margin:10px 0 6px">Key signals</div>
       ${bullets(market.keySignals)}
       <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#8c897e;margin:10px 0 6px">Recommendation</div>
