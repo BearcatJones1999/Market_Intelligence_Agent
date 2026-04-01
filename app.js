@@ -280,6 +280,49 @@ function parseConfidenceDisplay(value = "") {
   };
 }
 
+function normalizeCitationList(items, maxItems = 4) {
+  if (!Array.isArray(items)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const item of items) {
+    const url = String(item?.url || "").trim();
+    if (!url || seen.has(url)) continue;
+    seen.add(url);
+    out.push({
+      title: cleanPresentationText(item?.title || item?.text || url),
+      url,
+    });
+    if (out.length >= maxItems) break;
+  }
+  return out;
+}
+
+function citationHost(url = "") {
+  try {
+    return new URL(url).hostname.replace(/^www\./i, "");
+  } catch {
+    return "";
+  }
+}
+
+function renderCitationBlock(items, fallbackItems = [], label = "Sources") {
+  const primary = normalizeCitationList(items);
+  const fallback = normalizeCitationList(fallbackItems);
+  const finalList = primary.length ? primary : fallback;
+  if (!finalList.length) return "";
+  return `<div class="specialist-section-label">${esc(label)}</div>
+    <div class="specialist-citations">
+      ${finalList
+        .map(
+          (item) => `<a class="specialist-citation" href="${esc(item.url)}" target="_blank" rel="noopener noreferrer">
+            <span>${esc(item.title)}</span>
+            <span class="specialist-citation-host">${esc(citationHost(item.url) || "source")}</span>
+          </a>`
+        )
+        .join("")}
+    </div>`;
+}
+
 function summarizeAgentRun(run) {
   if (!run || typeof run !== "object") return "";
   const tool = String(run.tool || "");
@@ -439,6 +482,7 @@ function renderAgentTraceMini(agentTrace) {
 function renderSpecialistTraceCard(agentTrace, wtoTrade = null) {
   const specialists = agentTrace?.specialists;
   if (!specialists || typeof specialists !== "object") return "";
+  const contextAgent = specialists.industryContextAgent || {};
   const demand = specialists.demandSpecialist || {};
   const trade = specialists.tradeEvidenceAgent || {};
   const tradeDebug = specialists.tradeEvidenceAgentDebug || {};
@@ -447,6 +491,7 @@ function renderSpecialistTraceCard(agentTrace, wtoTrade = null) {
   const w = wtoTrade && typeof wtoTrade === "object" ? wtoTrade : null;
   const tradeProviderLabel =
     String(tradeDebug.provider || "").toLowerCase() === "anthropic" ? "Claude trade analyst" : "OpenAI trade analyst";
+  const contextConfidence = parseConfidenceDisplay(contextAgent.confidence || "");
   const demandConfidence = parseConfidenceDisplay(demand.confidence || "");
   const marketConfidence = parseConfidenceDisplay(market.confidence || "");
   const tradeConfidence = parseConfidenceDisplay(trade.confidence || "");
@@ -503,6 +548,27 @@ function renderSpecialistTraceCard(agentTrace, wtoTrade = null) {
       <div class="specialist-panel">
         <div class="specialist-head">
           <div>
+            <div class="specialist-title">Industry Context Agent</div>
+            <div class="specialist-subtitle">OpenAI web research</div>
+            ${
+              contextConfidence.detail
+                ? `<div class="specialist-confidence-note">${esc(contextConfidence.detail)}</div>`
+                : ""
+            }
+          </div>
+          <div class="specialist-confidence">${esc(contextConfidence.label)}</div>
+        </div>
+        <div class="specialist-thesis">${esc(cleanPresentationText(contextAgent.thesis || "No context brief recorded."))}</div>
+        ${renderAnalystRead(contextAgent)}
+        <div class="specialist-section-label">Key signals</div>
+        ${renderBulletList(contextAgent.keySignals)}
+        ${renderCitationBlock(contextAgent._citations, [], "Web Sources")}
+        <div class="specialist-section-label">Recommendation</div>
+        <div class="specialist-note">${esc(cleanPresentationText(contextAgent.recommendation || "No recommendation recorded."))}</div>
+      </div>
+      <div class="specialist-panel">
+        <div class="specialist-head">
+          <div>
             <div class="specialist-title">Demand Specialist</div>
             <div class="specialist-subtitle">OpenAI analyst</div>
             ${
@@ -517,6 +583,7 @@ function renderSpecialistTraceCard(agentTrace, wtoTrade = null) {
         ${renderAnalystRead(demand)}
         <div class="specialist-section-label">Key signals</div>
         ${renderBulletList(demand.keySignals)}
+        ${renderCitationBlock(demand._citations)}
         <div class="specialist-section-label">Recommendation</div>
         <div class="specialist-note">${esc(cleanPresentationText(demand.recommendation || "No recommendation recorded."))}</div>
       </div>
@@ -537,6 +604,7 @@ function renderSpecialistTraceCard(agentTrace, wtoTrade = null) {
         ${renderAnalystRead(market)}
         <div class="specialist-section-label">Key signals</div>
         ${renderBulletList(market.keySignals)}
+        ${renderCitationBlock(market._citations)}
         <div class="specialist-section-label">Recommendation</div>
         <div class="specialist-note">${esc(cleanPresentationText(market.recommendation || "No recommendation recorded."))}</div>
       </div>
@@ -557,6 +625,7 @@ function renderSpecialistTraceCard(agentTrace, wtoTrade = null) {
       ${renderAnalystRead(trade)}
       <div class="specialist-section-label">Key signals</div>
       ${renderBulletList(trade.keySignals)}
+      ${renderCitationBlock(trade._citations)}
       <div class="specialist-section-label">Recommendation</div>
       <div class="specialist-note">${esc(cleanPresentationText(trade.recommendation || "No recommendation recorded."))}</div>
       ${
@@ -595,6 +664,7 @@ function renderSpecialistTraceCard(agentTrace, wtoTrade = null) {
         <div class="specialist-confidence">${esc(synthesisConfidence.label)}</div>
       </div>
       <div class="specialist-thesis">${esc(cleanPresentationText(synthesis.combinedView || "No combined view recorded."))}</div>
+      ${renderCitationBlock(synthesis._citations, [], "Synthesis Sources")}
       <div class="specialist-two-col">
         <div>
           <div class="specialist-section-label">Where the agents agreed</div>
@@ -1309,36 +1379,6 @@ function renderResults() {
     </div>
   </div>`;
 
-  // Timeline
-  const timeline = [
-    { period: "Last Year", year: year - 1, summary: r.pastSummary, badge: r.pastTrendBadge },
-    { period: "This Year", year: year, summary: r.presentSummary, badge: r.presentTrendBadge },
-    { period: "Forecast", year: year + 1, summary: r.futureSummary, badge: r.futureTrendBadge, future: true },
-  ];
-  html += `<div class="section-heading">Timeline ${
-    timelineIsLive
-      ? '<span class="live-badge" style="font-size:9px">LIVE Google</span>'
-      : '<span class="ai-badge" style="font-size:9px">AI estimate</span>'
-  }</div>
-  <div class="three-col" style="margin-bottom:20px">${timeline
-    .map(
-      (tt) => `
-    <div class="timeline-card${tt.future ? " future-card" : ""}">
-      <div class="tc-period">${tt.period}</div>
-      <div class="tc-year">${tt.year}</div>
-      ${
-        tt.badge
-          ? `<div class="tc-badge ${badgeClass(tt.badge)}"><span>${badgeIcon(
-              tt.badge
-            )}</span> ${esc(tt.badge)}</div>`
-          : ""
-      }
-      <div class="tc-body">${esc(tt.summary)}</div>
-    </div>`
-    )
-    .join("")}
-  </div>`;
-
   if (w && !(r?.agentTrace?.specialists && typeof r.agentTrace.specialists === "object")) {
     const partners = Array.isArray(w.partnerCandidateNames) && w.partnerCandidateNames.length
       ? w.partnerCandidateNames
@@ -1762,6 +1802,7 @@ function buildReportHTML(r, n, t, w) {
     : "";
   const specialistTraceHTML = specialists
     ? (() => {
+        const contextAgent = specialists.industryContextAgent || {};
         const demand = specialists.demandSpecialist || {};
         const trade = specialists.tradeEvidenceAgent || {};
         const tradeDebug = specialists.tradeEvidenceAgentDebug || {};
@@ -1810,6 +1851,17 @@ function buildReportHTML(r, n, t, w) {
         };
         return `<div class="sec-title">Specialist Agents <span class="badge-pill live" style="font-size:8px">OpenAI + Claude</span></div>
   <div class="grid-2" style="margin-bottom:10px">
+    <div class="stat" style="border-color:#dbeafe;background:#f8fbff">
+      <div class="stat-lbl" style="color:#2563eb">Industry Context Agent</div>
+      <div class="stat-sub">OpenAI web research • ${esc(formatConfidenceLabel(contextAgent.confidence || ""))}</div>
+      <div class="report-body" style="font-size:11px;margin-top:6px">${esc(cleanPresentationText(contextAgent.thesis || "No context brief recorded."))}</div>
+      ${analystRead(contextAgent)}
+      <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#8c897e;margin:10px 0 6px">Key signals</div>
+      ${bullets(contextAgent.keySignals)}
+      ${renderCitationBlock(contextAgent._citations, [], "Web Sources")}
+      <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#8c897e;margin:10px 0 6px">Recommendation</div>
+      <div class="report-body" style="font-size:11px">${esc(cleanPresentationText(contextAgent.recommendation || "No recommendation recorded."))}</div>
+    </div>
     <div class="stat" style="border-color:#bfcff8;background:#f8fbff">
       <div class="stat-lbl" style="color:#2563eb">Demand Specialist</div>
       <div class="stat-sub">OpenAI analyst • ${esc(formatConfidenceLabel(demand.confidence || ""))}</div>
@@ -1817,6 +1869,7 @@ function buildReportHTML(r, n, t, w) {
       ${analystRead(demand)}
       <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#8c897e;margin:10px 0 6px">Key signals</div>
       ${bullets(demand.keySignals)}
+      ${renderCitationBlock(demand._citations)}
       <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#8c897e;margin:10px 0 6px">Recommendation</div>
       <div class="report-body" style="font-size:11px">${esc(cleanPresentationText(demand.recommendation || "No recommendation recorded."))}</div>
     </div>
@@ -1827,6 +1880,7 @@ function buildReportHTML(r, n, t, w) {
       ${analystRead(trade)}
       <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#8c897e;margin:10px 0 6px">Key signals</div>
       ${bullets(trade.keySignals)}
+      ${renderCitationBlock(trade._citations)}
       <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#8c897e;margin:10px 0 6px">Recommendation</div>
       <div class="report-body" style="font-size:11px">${esc(cleanPresentationText(trade.recommendation || "No recommendation recorded."))}</div>
       ${
@@ -1858,6 +1912,7 @@ function buildReportHTML(r, n, t, w) {
       ${analystRead(market)}
       <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#8c897e;margin:10px 0 6px">Key signals</div>
       ${bullets(market.keySignals)}
+      ${renderCitationBlock(market._citations)}
       <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#8c897e;margin:10px 0 6px">Recommendation</div>
       <div class="report-body" style="font-size:11px">${esc(cleanPresentationText(market.recommendation || "No recommendation recorded."))}</div>
     </div>
@@ -1866,6 +1921,7 @@ function buildReportHTML(r, n, t, w) {
     <div class="stat-lbl" style="color:#7c3aed">Final Synthesis</div>
     <div class="stat-sub">${esc(formatConfidenceLabel(synthesis.confidence || ""))}</div>
     <div class="report-body" style="font-size:11px;margin-top:6px">${esc(cleanPresentationText(synthesis.combinedView || "No combined view recorded."))}</div>
+    ${renderCitationBlock(synthesis._citations, [], "Synthesis Sources")}
     <div class="grid-2" style="margin-top:10px">
       <div>
         <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#8c897e;margin-bottom:6px">Where the agents agreed</div>
@@ -1972,7 +2028,7 @@ function buildReportHTML(r, n, t, w) {
   return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Market Intel Agent  ${esc(
     r.category
   )}</title>
-<style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,'Segoe UI',Helvetica,Arial,sans-serif;font-size:13px;color:#1a1814;background:#fff;line-height:1.5}.page{max-width:780px;margin:0 auto;padding:40px 40px 60px}.rpt-header{display:flex;justify-content:space-between;align-items:flex-start;padding-bottom:16px;border-bottom:3px solid #2563eb;margin-bottom:24px}.rpt-logo{font-size:18px;font-weight:800;color:#2563eb}.rpt-meta{text-align:right;font-size:11px;color:#8c897e;line-height:1.8}h1{font-size:26px;font-weight:700;letter-spacing:-0.02em;margin-bottom:4px}h1 em{color:#2563eb;font-style:italic}.sub{font-size:11px;color:#8c897e;margin-bottom:20px}.sec-title{font-size:10px;font-weight:700;letter-spacing:0.09em;text-transform:uppercase;color:#8c897e;margin:22px 0 10px;padding-top:16px;border-top:1px solid #e4e1d8}.grid-3{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:4px}.grid-4{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:4px}.grid-2{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}.stat{background:#f8f7f4;border:1px solid #e4e1d8;border-radius:7px;padding:12px 14px;position:relative;overflow:hidden}.stat.live{border-color:#99f6e4}.stat.live::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:#0d9488}.stat-lbl{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#8c897e;margin-bottom:5px}.stat-val{font-size:22px;font-weight:800;line-height:1;margin-bottom:3px;letter-spacing:-0.02em}.stat-sub{font-size:10px;color:#8c897e}.c-blue{color:#2563eb}.c-green{color:#16a34a}.c-red{color:#dc2626}.c-purple{color:#7c3aed}.c-amber{color:#d97706}.c-teal{color:#0d9488}.badge-pill{display:inline-block;font-size:8px;font-weight:700;padding:1px 6px;border-radius:10px;margin-left:6px;vertical-align:middle}.badge-pill.live{background:#f0fdfa;color:#0d9488;border:1px solid #99f6e4}.badge-pill.ai{background:#f5f3ff;color:#7c3aed;border:1px solid #ddd6fe}.bar-row{margin-bottom:9px}.bar-lbl{display:flex;justify-content:space-between;font-size:11px;color:#4a4740;margin-bottom:4px}.bar-lbl span:last-child{font-weight:700}.bar-track{height:7px;background:#f1efe9;border-radius:4px;overflow:hidden}.bar-fill{height:100%;border-radius:4px}.tl-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:4px}.tl-box{border:1px solid #e4e1d8;border-radius:7px;padding:14px;background:#f8f7f4}.tl-box.future{border-color:#bfcff8;background:#eff4ff}.tl-period{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#8c897e;margin-bottom:2px}.future .tl-period{color:#2563eb}.tl-year{font-size:18px;font-weight:800;margin-bottom:7px}.badge{display:inline-block;font-size:9px;font-weight:700;padding:2px 8px;border-radius:20px;margin-bottom:7px}.badge-green{background:#f0fdf4;color:#16a34a;border:1px solid #bbf7d0}.badge-amber{background:#fffbeb;color:#d97706;border:1px solid #fde68a}.badge-red{background:#fef2f2;color:#dc2626;border:1px solid #fecaca}.badge-purple{background:#f5f3ff;color:#7c3aed;border:1px solid #ddd6fe}.badge-gray{background:#f1efe9;color:#4a4740;border:1px solid #e4e1d8}.tl-body{font-size:10.5px;color:#4a4740;line-height:1.6}.report-body{font-size:12.5px;color:#4a4740;line-height:1.75;white-space:pre-wrap}.chip-group{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:5px}.chip{font-size:11px;font-weight:500;padding:4px 10px;border-radius:20px;border:1px solid #e4e1d8;color:#4a4740;background:#f1efe9}.chip.hot{background:#eff4ff;color:#2563eb;border-color:#bfcff8}.chip.warm{background:#fffbeb;color:#d97706;border-color:#fde68a}.chip.cold{background:#f1efe9;color:#8c897e;text-decoration:line-through}.chip.sub{background:#f5f3ff;color:#7c3aed;border-color:#ddd6fe}.kw-lbl{font-size:9.5px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:#8c897e;margin:10px 0 5px}.brand-row{display:flex;align-items:center;gap:8px;padding:8px 12px;border:1px solid #e4e1d8;border-radius:5px;margin-bottom:5px;font-size:12px;font-weight:500;background:#f8f7f4}.brand-row.lead{border-color:#bfcff8;background:#eff4ff}.brand-row.rise{border-color:#bbf7d0;background:#f0fdf4}.brand-num{width:18px;height:18px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:800;flex-shrink:0}.brand-num.lead{background:#2563eb;color:white}.brand-num.rise{background:#16a34a;color:white}.prod-box{padding:9px 11px;border:1px solid #e4e1d8;border-radius:5px;background:#f8f7f4;font-size:11px;color:#4a4740}.ps{font-size:8.5px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:3px}.ps.hot{color:#16a34a}.ps.fade{color:#8c897e}.prod-box.fading{opacity:0.6}.drv-lbl{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:8px}.drv-lbl.bull{color:#16a34a}.drv-lbl.bear{color:#dc2626}.drv{display:flex;gap:6px;padding:7px 10px;border-radius:5px;margin-bottom:5px;font-size:11px;line-height:1.5;color:#4a4740}.drv.bull{background:#f0fdf4;border:1px solid #bbf7d0}.drv.bear{background:#fef2f2;border:1px solid #fecaca}.verdict{padding:12px 16px;background:#f5f3ff;border:1px solid #ddd6fe;border-radius:7px;display:flex;gap:12px;margin-top:14px}.verdict-lbl{font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:0.07em;color:#7c3aed;white-space:nowrap}.verdict-txt{font-size:11.5px;color:#4a4740;line-height:1.65}.src-row{display:flex;gap:12px;padding:12px 0;border-bottom:1px solid #e4e1d8}.src-row:last-child{border-bottom:none}.src-num{width:20px;height:20px;border-radius:50%;background:#f1efe9;border:1px solid #e4e1d8;display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:800;color:#8c897e;flex-shrink:0}.src-name{font-size:12px;font-weight:700;margin-bottom:1px}.src-type{font-size:9.5px;color:#8c897e;margin-bottom:4px;font-family:monospace}.src-desc{font-size:11px;color:#4a4740;line-height:1.5}.disclaimer{background:#fffbeb;border:1px solid #fde68a;border-radius:7px;padding:12px 16px;font-size:11px;color:#92400e;line-height:1.6;margin-top:14px}.footer{margin-top:32px;padding-top:12px;border-top:1px solid #e4e1d8;font-size:10px;color:#8c897e;display:flex;justify-content:space-between}</style></head><body><div class="page">
+<style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,'Segoe UI',Helvetica,Arial,sans-serif;font-size:13px;color:#1a1814;background:#fff;line-height:1.5}.page{max-width:780px;margin:0 auto;padding:40px 40px 60px}.rpt-header{display:flex;justify-content:space-between;align-items:flex-start;padding-bottom:16px;border-bottom:3px solid #2563eb;margin-bottom:24px}.rpt-logo{font-size:18px;font-weight:800;color:#2563eb}.rpt-meta{text-align:right;font-size:11px;color:#8c897e;line-height:1.8}h1{font-size:26px;font-weight:700;letter-spacing:-0.02em;margin-bottom:4px}h1 em{color:#2563eb;font-style:italic}.sub{font-size:11px;color:#8c897e;margin-bottom:20px}.sec-title{font-size:10px;font-weight:700;letter-spacing:0.09em;text-transform:uppercase;color:#8c897e;margin:22px 0 10px;padding-top:16px;border-top:1px solid #e4e1d8}.grid-3{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:4px}.grid-4{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:4px}.grid-2{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}.stat{background:#f8f7f4;border:1px solid #e4e1d8;border-radius:7px;padding:12px 14px;position:relative;overflow:hidden}.stat.live{border-color:#99f6e4}.stat.live::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:#0d9488}.stat-lbl{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#8c897e;margin-bottom:5px}.stat-val{font-size:22px;font-weight:800;line-height:1;margin-bottom:3px;letter-spacing:-0.02em}.stat-sub{font-size:10px;color:#8c897e}.c-blue{color:#2563eb}.c-green{color:#16a34a}.c-red{color:#dc2626}.c-purple{color:#7c3aed}.c-amber{color:#d97706}.c-teal{color:#0d9488}.badge-pill{display:inline-block;font-size:8px;font-weight:700;padding:1px 6px;border-radius:10px;margin-left:6px;vertical-align:middle}.badge-pill.live{background:#f0fdfa;color:#0d9488;border:1px solid #99f6e4}.badge-pill.ai{background:#f5f3ff;color:#7c3aed;border:1px solid #ddd6fe}.bar-row{margin-bottom:9px}.bar-lbl{display:flex;justify-content:space-between;font-size:11px;color:#4a4740;margin-bottom:4px}.bar-lbl span:last-child{font-weight:700}.bar-track{height:7px;background:#f1efe9;border-radius:4px;overflow:hidden}.bar-fill{height:100%;border-radius:4px}.tl-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:4px}.tl-box{border:1px solid #e4e1d8;border-radius:7px;padding:14px;background:#f8f7f4}.tl-box.future{border-color:#bfcff8;background:#eff4ff}.tl-period{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#8c897e;margin-bottom:2px}.future .tl-period{color:#2563eb}.tl-year{font-size:18px;font-weight:800;margin-bottom:7px}.badge{display:inline-block;font-size:9px;font-weight:700;padding:2px 8px;border-radius:20px;margin-bottom:7px}.badge-green{background:#f0fdf4;color:#16a34a;border:1px solid #bbf7d0}.badge-amber{background:#fffbeb;color:#d97706;border:1px solid #fde68a}.badge-red{background:#fef2f2;color:#dc2626;border:1px solid #fecaca}.badge-purple{background:#f5f3ff;color:#7c3aed;border:1px solid #ddd6fe}.badge-gray{background:#f1efe9;color:#4a4740;border:1px solid #e4e1d8}.tl-body{font-size:10.5px;color:#4a4740;line-height:1.6}.report-body{font-size:12.5px;color:#4a4740;line-height:1.75;white-space:pre-wrap}.chip-group{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:5px}.chip{font-size:11px;font-weight:500;padding:4px 10px;border-radius:20px;border:1px solid #e4e1d8;color:#4a4740;background:#f1efe9}.chip.hot{background:#eff4ff;color:#2563eb;border-color:#bfcff8}.chip.warm{background:#fffbeb;color:#d97706;border-color:#fde68a}.chip.cold{background:#f1efe9;color:#8c897e;text-decoration:line-through}.chip.sub{background:#f5f3ff;color:#7c3aed;border-color:#ddd6fe}.kw-lbl{font-size:9.5px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:#8c897e;margin:10px 0 5px}.brand-row{display:flex;align-items:center;gap:8px;padding:8px 12px;border:1px solid #e4e1d8;border-radius:5px;margin-bottom:5px;font-size:12px;font-weight:500;background:#f8f7f4}.brand-row.lead{border-color:#bfcff8;background:#eff4ff}.brand-row.rise{border-color:#bbf7d0;background:#f0fdf4}.brand-num{width:18px;height:18px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:800;flex-shrink:0}.brand-num.lead{background:#2563eb;color:white}.brand-num.rise{background:#16a34a;color:white}.prod-box{padding:9px 11px;border:1px solid #e4e1d8;border-radius:5px;background:#f8f7f4;font-size:11px;color:#4a4740}.ps{font-size:8.5px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:3px}.ps.hot{color:#16a34a}.ps.fade{color:#8c897e}.prod-box.fading{opacity:0.6}.drv-lbl{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:8px}.drv-lbl.bull{color:#16a34a}.drv-lbl.bear{color:#dc2626}.drv{display:flex;gap:6px;padding:7px 10px;border-radius:5px;margin-bottom:5px;font-size:11px;line-height:1.5;color:#4a4740}.drv.bull{background:#f0fdf4;border:1px solid #bbf7d0}.drv.bear{background:#fef2f2;border:1px solid #fecaca}.verdict{padding:12px 16px;background:#f5f3ff;border:1px solid #ddd6fe;border-radius:7px;display:flex;gap:12px;margin-top:14px}.verdict-lbl{font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:0.07em;color:#7c3aed;white-space:nowrap}.verdict-txt{font-size:11.5px;color:#4a4740;line-height:1.65}.src-row{display:flex;gap:12px;padding:12px 0;border-bottom:1px solid #e4e1d8}.src-row:last-child{border-bottom:none}.src-num{width:20px;height:20px;border-radius:50%;background:#f1efe9;border:1px solid #e4e1d8;display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:800;color:#8c897e;flex-shrink:0}.src-name{font-size:12px;font-weight:700;margin-bottom:1px}.src-type{font-size:9.5px;color:#8c897e;margin-bottom:4px;font-family:monospace}.src-desc{font-size:11px;color:#4a4740;line-height:1.5}.specialist-citations{display:flex;flex-direction:column;gap:7px;margin:6px 0 2px}.specialist-citation{display:flex;justify-content:space-between;gap:12px;align-items:center;text-decoration:none;border:1px solid #e4e1d8;border-radius:8px;background:#ffffff;padding:8px 10px;font-size:11px;color:#4a4740;line-height:1.45}.specialist-citation-host{flex-shrink:0;font-size:9px;text-transform:uppercase;letter-spacing:.05em;color:#8c897e}.disclaimer{background:#fffbeb;border:1px solid #fde68a;border-radius:7px;padding:12px 16px;font-size:11px;color:#92400e;line-height:1.6;margin-top:14px}.footer{margin-top:32px;padding-top:12px;border-top:1px solid #e4e1d8;font-size:10px;color:#8c897e;display:flex;justify-content:space-between}</style></head><body><div class="page">
   <div class="rpt-header"><div><div class="rpt-logo">Market Intel Agent</div><div style="font-size:10px;color:#8c897e;margin-top:2px">Market Intelligence</div></div><div class="rpt-meta">Generated ${date}<br>Curve: ${esc(
     r.trendCurveShape
   )}<br>News: Live via NewsAPI.org<br>Google: ${
@@ -2069,42 +2125,6 @@ function buildReportHTML(r, n, t, w) {
         `<div class="bar-row"><div class="bar-lbl"><span>${l}</span><span>${v}/100</span></div><div class="bar-track"><div class="bar-fill" style="width:${v}%;background:${c}"></div></div></div>`
     )
     .join("")}
-
-  <div class="sec-title">Timeline <span class="badge-pill ${
-    timelineIsLive ? "live" : "ai"
-  }" style="font-size:8px">${timelineIsLive ? "LIVE Google" : "AI estimate"}</span></div>
-  <div class="tl-grid">
-    ${[
-      {
-        period: "Last Year",
-        year: year - 1,
-        summary: r.pastSummary,
-        badge: r.pastTrendBadge,
-      },
-      {
-        period: "This Year",
-        year: year,
-        summary: r.presentSummary,
-        badge: r.presentTrendBadge,
-      },
-      {
-        period: "Forecast",
-        year: year + 1,
-        summary: r.futureSummary,
-        badge: r.futureTrendBadge,
-        future: true,
-      },
-    ]
-      .map(
-        (tt) =>
-          `<div class="tl-box${tt.future ? " future" : ""}"><div class="tl-period">${tt.period}</div><div class="tl-year">${tt.year}</div>${
-            tt.badge
-              ? `<div class="badge ${badgeCls(tt.badge)}">${esc(tt.badge)}</div><br>`
-              : ""
-          }<div class="tl-body">${esc(tt.summary || "")}</div></div>`
-      )
-      .join("")}
-  </div>
 
   ${wtoHTML}
   ${followupHTML}

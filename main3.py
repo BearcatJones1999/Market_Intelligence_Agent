@@ -2120,6 +2120,72 @@ def _extract_text_from_responses_api(resp_json: dict) -> str:
     raise ValueError("Could not extract text from OpenAI response payload")
 
 
+def _extract_openai_citations(resp_json: dict, max_items: int = 6) -> list[dict]:
+    """
+    Pull URL/title annotations out of Responses API output so web-search-backed
+    specialist results can surface citations in the UI.
+    """
+
+    citations: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+
+    def _push(title: str | None, url: str | None) -> None:
+        clean_url = str(url or "").strip()
+        if not clean_url or not clean_url.lower().startswith(("http://", "https://")):
+            return
+        clean_title = str(title or "").strip() or clean_url
+        key = (clean_title, clean_url)
+        if key in seen:
+            return
+        seen.add(key)
+        citations.append({"title": clean_title, "url": clean_url})
+
+    def _walk(node) -> None:
+        if len(citations) >= max_items:
+            return
+        if isinstance(node, dict):
+            node_type = str(node.get("type") or "").lower()
+            if node_type in {"url_citation", "citation"}:
+                _push(node.get("title") or node.get("text"), node.get("url"))
+            if isinstance(node.get("url"), str):
+                _push(
+                    node.get("title")
+                    or node.get("name")
+                    or node.get("label")
+                    or node.get("text")
+                    or node.get("hostname")
+                    or node.get("domain"),
+                    node.get("url"),
+                )
+            if isinstance(node.get("href"), str):
+                _push(
+                    node.get("title")
+                    or node.get("name")
+                    or node.get("label")
+                    or node.get("text")
+                    or node.get("hostname")
+                    or node.get("domain"),
+                    node.get("href"),
+                )
+            if isinstance(node.get("source"), dict):
+                _walk(node.get("source"))
+            for key in ("annotations", "content", "output", "results", "items", "data"):
+                value = node.get(key)
+                if isinstance(value, (list, dict)):
+                    _walk(value)
+            for value in node.values():
+                if isinstance(value, (list, dict)):
+                    _walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                if len(citations) >= max_items:
+                    break
+                _walk(item)
+
+    _walk(resp_json)
+    return citations
+
+
 async def _openai_structured_json(
     api_key: str,
     model: str,
@@ -2128,6 +2194,7 @@ async def _openai_structured_json(
     schema_name: str,
     schema: dict,
     max_output_tokens: int = 700,
+    enable_web_search: bool = False,
 ) -> dict | None:
     payload = {
         "model": model,
@@ -2143,6 +2210,19 @@ async def _openai_structured_json(
         "max_output_tokens": max_output_tokens,
         "store": False,
     }
+    if enable_web_search:
+        payload["tools"] = [
+            {
+                "type": "web_search",
+                "user_location": {
+                    "type": "approximate",
+                    "country": "US",
+                    "timezone": "America/New_York",
+                },
+                "search_context_size": "medium",
+            }
+        ]
+        payload["tool_choice"] = "auto"
     for msg in user_messages:
         payload["input"].append({"role": "user", "content": msg})
     headers = {
@@ -2154,8 +2234,14 @@ async def _openai_structured_json(
             resp = await client.post("https://api.openai.com/v1/responses", headers=headers, json=payload)
         if resp.status_code != 200:
             return None
-        text = _extract_text_from_responses_api(resp.json()).strip()
-        return json.loads(text) if text else None
+        resp_json = resp.json()
+        text = _extract_text_from_responses_api(resp_json).strip()
+        parsed = json.loads(text) if text else None
+        if isinstance(parsed, dict):
+            citations = _extract_openai_citations(resp_json)
+            if citations:
+                parsed["_citations"] = citations
+        return parsed
     except Exception:
         return None
 
@@ -2375,6 +2461,86 @@ def _trade_evidence_schema() -> dict:
     }
 
 
+def _industry_context_schema() -> dict:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "categoryOverview",
+            "brandPositioning",
+            "competitionContext",
+            "consumerBehaviorContext",
+            "sourcingContext",
+        ],
+        "properties": {
+            "categoryOverview": {"type": "string"},
+            "brandPositioning": {"type": "string"},
+            "competitionContext": {"type": "string"},
+            "consumerBehaviorContext": {"type": "string"},
+            "sourcingContext": {"type": "string"},
+        },
+    }
+
+
+def _build_industry_context_agent(
+    category: str,
+    industry_context: dict | None,
+    demand_result: dict | None = None,
+    trade_result: dict | None = None,
+    market_result: dict | None = None,
+) -> dict:
+    ctx = industry_context if isinstance(industry_context, dict) else {}
+    category_overview = str(ctx.get("categoryOverview") or "").strip()
+    brand_positioning = str(ctx.get("brandPositioning") or "").strip()
+    competition_context = str(ctx.get("competitionContext") or "").strip()
+    consumer_context = str(ctx.get("consumerBehaviorContext") or "").strip()
+    sourcing_context = str(ctx.get("sourcingContext") or "").strip()
+
+    if not any((category_overview, brand_positioning, competition_context, consumer_context, sourcing_context)):
+        demand_ctx = str((demand_result or {}).get("industryContext") or "").strip()
+        trade_ctx = str((trade_result or {}).get("industryContext") or "").strip()
+        market_ctx = str((market_result or {}).get("industryContext") or "").strip()
+        demand_meaning = str((demand_result or {}).get("whatItMeans") or "").strip()
+        market_meaning = str((market_result or {}).get("whatItMeans") or "").strip()
+
+        category_overview = demand_meaning or market_meaning or f"Broader market context for {category} is limited."
+        brand_positioning = demand_ctx or ""
+        competition_context = market_ctx or ""
+        consumer_context = demand_ctx or ""
+        sourcing_context = trade_ctx or market_ctx or ""
+
+    thesis = category_overview or brand_positioning or f"Broader market context for {category} is limited."
+    what_it_means = brand_positioning or consumer_context or "Broader brand and category context remains limited."
+    industry_context_text = competition_context or sourcing_context or "Competitive and sourcing context was limited."
+    decision_impact = (
+        "Use this context as a shared background brief for the demand, trade, and market-constraints analysts."
+    )
+    main_uncertainty = (
+        "This is contextual web research rather than a category-specific primary-source market report."
+    )
+    key_signals = [
+        x
+        for x in (category_overview, brand_positioning, consumer_context)
+        if isinstance(x, str) and x.strip()
+    ][:4]
+    if not key_signals:
+        key_signals = ["Industry context agent could not build a strong shared context brief."]
+
+    return {
+        "role": "Industry Context Agent",
+        "thesis": thesis,
+        "confidence": "medium",
+        "mostImportantSignal": category_overview or "Broader category context was only partially resolved.",
+        "whatItMeans": what_it_means,
+        "industryContext": industry_context_text,
+        "decisionImpact": decision_impact,
+        "mainUncertainty": main_uncertainty,
+        "keySignals": key_signals,
+        "recommendation": "Use this brief as shared market context rather than as a standalone recommendation.",
+        "_citations": list(ctx.get("_citations") or []),
+    }
+
+
 def _multi_agent_synthesis_schema() -> dict:
     return {
         "type": "object",
@@ -2397,6 +2563,8 @@ def _fallback_specialist_synthesis(demand_result: dict, market_result: dict) -> 
     market_conf = str((market_result or {}).get("confidence") or "").strip().lower()
     demand_rec = str((demand_result or {}).get("recommendation") or "").strip()
     market_rec = str((market_result or {}).get("recommendation") or "").strip()
+    demand_context = str((demand_result or {}).get("industryContext") or "").strip()
+    market_context = str((market_result or {}).get("industryContext") or "").strip()
 
     combined_parts = []
     if demand_thesis:
@@ -2413,13 +2581,15 @@ def _fallback_specialist_synthesis(demand_result: dict, market_result: dict) -> 
         confidence = demand_conf or market_conf or "medium"
 
     agreement_summary = (
-        "Both specialists indicate meaningful demand, but not an unconstrained premium market. "
-        "Consumer interest is improving while price realization remains in a competitive mid-market band."
+        "Across the specialist team, there is evidence of meaningful consumer interest, but not an unconstrained premium market. "
+        "The shared picture is improving attention with practical pricing and supply-side limits."
     )
     tension_summary = (
-        "The main tension is between strong demand momentum and practical pricing limits. "
-        "Interest is accelerating faster than resale prices, so execution matters more than assuming broad pricing power."
+        "The main tension is between stronger demand and category context on one side, and practical pricing or supply constraints on the other. "
+        "Interest is improving faster than proof of broad pricing power."
     )
+    if demand_context or market_context:
+        agreement_summary += " Industry context suggests the category has broader relevance beyond the narrow tool outputs."
 
     recommended_action = market_rec or demand_rec or (
         "Increase inventory and marketing carefully, while monitoring weekly pricing and sell-through before making larger commitments."
@@ -2630,7 +2800,7 @@ async def _run_specialist_agents(
         "trends": live_context.get("trends"),
         "computedTrendTimeline": live_context.get("computedTrendTimeline"),
         "toolPlan": [t for t in tool_plan if t in ("news", "trends")],
-        "toolRuns": [r for r in tool_runs if str((r or {}).get("tool") or "") in ("news", "trends")],
+            "toolRuns": [r for r in tool_runs if str((r or {}).get("tool") or "") in ("news", "trends")],
     }
     market_context = {
         "ebayPricing": live_context.get("ebayPricing"),
@@ -2645,6 +2815,31 @@ async def _run_specialist_agents(
             if str((r or {}).get("tool") or "") in ("ebay_pricing", "ebay_map", "wto_trade", "pricing_history")
         ],
     }
+    industry_context = await _openai_structured_json(
+        api_key=api_key,
+        model=model,
+        system_prompt=(
+            "You are a market research analyst preparing a short context brief for other specialist agents. "
+            "Use web search to gather current, high-level market context for the category. "
+            "Do not invent precise unsupported numbers. Provide concise prose fields that summarize category context, "
+            "brand positioning, competitive context, consumer behavior patterns, and likely sourcing context."
+        ),
+        user_messages=[
+            f"Category: {category}",
+            "Create a concise current market context brief that will help demand, trade, and market-constraints analysts reason more globally.",
+        ],
+        schema_name="industry_context_brief",
+        schema=_industry_context_schema(),
+        max_output_tokens=500,
+        enable_web_search=True,
+    )
+    if isinstance(industry_context, dict):
+        demand_context["industryContext"] = industry_context
+        market_context["industryContext"] = industry_context
+    industry_context_citations = (
+        (industry_context or {}).get("_citations", []) if isinstance(industry_context, dict) else []
+    )
+    industry_context_agent = _build_industry_context_agent(category, industry_context)
 
     trade_system_prompt = (
         "You are a senior trade analyst serving as the WTO Trade Evidence Agent in a market-intel team. "
@@ -2659,6 +2854,7 @@ async def _run_specialist_agents(
     trade_user_messages = [
         f"Category: {category}",
         "Raw WTO trade context JSON:\n" + json.dumps(wto_trade, ensure_ascii=True),
+        "Industry context JSON:\n" + json.dumps(industry_context or {}, ensure_ascii=True),
         (
             "Analyze this for a downstream market-constraints analyst. "
             "Emphasize likely tariff pressure, HS-code specificity, partner/supplier evidence, inferred critical components, and any important data gaps. "
@@ -2838,20 +3034,33 @@ async def _run_specialist_agents(
             "recommendation": "Treat market-side interpretation as incomplete.",
         }
 
+    industry_context_agent = _build_industry_context_agent(
+        category,
+        industry_context,
+        demand_result=demand_result,
+        trade_result=trade_result,
+        market_result=market_result,
+    )
+    if industry_context_citations and not list(industry_context_agent.get("_citations") or []):
+        industry_context_agent["_citations"] = list(industry_context_citations)
+
     synthesis = await _openai_structured_json(
         api_key=api_key,
         model=model,
         system_prompt=(
             "You are the lead analyst and final synthesizer in a multi-agent market-intel team. "
-            "Reconcile the specialist views into one combined assessment. "
+            "Reconcile all specialist outputs into one combined assessment. "
             "Do not merely concatenate tool findings. Explain where they agree, where they pull in different directions, and what the best practical action is. "
+            "Explicitly consider the Industry Context Agent, Demand Specialist, WTO Trade Evidence Agent, and Market Constraints Specialist. "
             "You may use broad industry knowledge from your general training to frame category and brand context, but clearly separate supplied evidence from industry-informed inference and do not invent precise unsupported statistics."
         ),
         user_messages=[
             f"Category: {category}",
+            "Industry context agent JSON:\n" + json.dumps(industry_context_agent, ensure_ascii=True),
             "Demand specialist JSON:\n" + json.dumps(demand_result, ensure_ascii=True),
             "Trade evidence agent JSON:\n" + json.dumps(trade_result, ensure_ascii=True),
             "Market specialist JSON:\n" + json.dumps(market_result, ensure_ascii=True),
+            "Industry context JSON:\n" + json.dumps(industry_context or {}, ensure_ascii=True),
         ],
         schema_name="multi_agent_synthesis",
         schema=_multi_agent_synthesis_schema(),
@@ -2865,6 +3074,9 @@ async def _run_specialist_agents(
 
     return {
         "mode": "specialist-synthesis",
+        "industryContextAgent": industry_context_agent,
+        "industryContextBrief": industry_context,
+        "industryContextCitations": industry_context_citations,
         "demandSpecialist": demand_result,
         "tradeEvidenceAgent": trade_result,
         "tradeEvidenceAgentDebug": trade_debug,

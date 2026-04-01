@@ -144,6 +144,10 @@ body { background: var(--bg); color: var(--text); font-family: var(--font); -web
 .specialist-bullet::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: var(--accent); position: absolute; left: 0; top: 8px; }
 .specialist-note { font-size: 12px; color: var(--text2); line-height: 1.55; }
 .specialist-empty { font-size: 12px; color: var(--muted); }
+.specialist-citations { display: flex; flex-direction: column; gap: 8px; margin-bottom: 4px; }
+.specialist-citation { display: flex; justify-content: space-between; gap: 12px; align-items: center; text-decoration: none; border: 1px solid var(--border); border-radius: 10px; background: var(--bg2); padding: 9px 11px; font-size: 12px; color: var(--text2); line-height: 1.45; }
+.specialist-citation:hover { border-color: var(--accent-border); background: var(--accent-light); color: var(--text); }
+.specialist-citation-host { flex-shrink: 0; font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
 .specialist-synthesis { border: 1px solid var(--purple-border); border-radius: var(--radius-sm); background: #faf7ff; padding: 16px; }
 .specialist-synthesis-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
 .specialist-two-col { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; margin-top: 10px; }
