@@ -1,120 +1,132 @@
 # Market Intelligence Agent
 
-Market Intelligence Agent is an agent-based analytics project that gathers market signals from multiple external sources and turns them into a structured, decision-useful view of product demand, pricing, and trend direction.
-
-The goal of the project is to help a user move from scattered online signals to a more organized market read by combining data collection, lightweight forecasting, and generated reporting in one workflow.
+A multi-agent market research system that combines live API data, AI specialist analysis, and lightweight forecasting to generate structured market-intelligence reports.
 
 ## Overview
 
-This project is designed to answer questions like:
+The Market Intelligence Agent is designed to act like a small analyst team rather than a single chatbot. Given a product or category query, it gathers live market signals, routes them through specialist agents, and produces a presentation-ready report.
 
-- Is interest in a product or category rising or fading?
-- What are current pricing patterns across available listings?
-- Are news and online discussions supporting or contradicting the trend?
-- What does recent demand momentum suggest about the next period?
+The system is built to support questions like:
+- What is the current demand for this product category?
+- What pricing signals exist in the market right now?
+- Are there trade or tariff risks that could affect supply-side constraints?
+- What recommendation should a user make based on current evidence?
 
-Rather than relying on a single source, the agent combines multiple signals into a broader market view.
+## Current Architecture
 
-## Core Capabilities
+### Backend
+- Python
+- FastAPI
+- Async API orchestration
+- Multi-agent analysis pipeline
+- ARIMA-based Google Trends forecasting
 
-The agent can support workflows such as:
+### Frontend
+- HTML
+- CSS
+- Vanilla JavaScript
+- Live report rendering
+- Downloadable HTML export
 
-- collecting market signals from multiple external APIs and web sources
-- evaluating product-level or category-level pricing data
-- reviewing recent news coverage for trend context
-- incorporating search-interest or trend data
-- analyzing discussion-based sentiment or topic frequency
-- generating reports that summarize findings in a readable format
-- producing a time-series forecast of demand trends using ARIMA
-- allowing follow-up interaction through an **Ask Follow Up Questions** workflow
+## Agent Workflow
 
-## Project Purpose
+The app follows a plan-act-synthesize workflow:
 
-This repository was built as a practical experiment in agentic analytics: combining data engineering, external APIs, business logic, and reporting into a single workflow that can support lightweight market research.
+1. **Planner**
+   - Selects which tools are needed for the query
+   - Avoids always pulling every source by default
 
-It sits at the intersection of:
+2. **Live Evidence Collection**
+   - News coverage
+   - Google Trends
+   - eBay pricing
+   - WTO trade/tariff context
+   - Stored pricing history
 
-- market intelligence
-- agentic AI workflows
-- time-series forecasting
-- pricing analysis
-- business analytics
+3. **Specialist Agents**
+   - **Industry Context Agent**
+     - Uses web search to build a broader market context brief
+     - Supplies citations and high-level category/brand context
+   - **Demand Specialist**
+     - Interprets demand momentum, seasonality, and consumer attention
+   - **WTO Trade Evidence Agent**
+     - Interprets tariff/trade context and likely supply-chain exposure
+   - **Market Constraints Specialist**
+     - Interprets pricing pressure, competition, and supply-side constraints
 
-## High-Level Workflow
+4. **Final Synthesis**
+   - Reconciles the specialist views
+   - Produces a combined recommendation and confidence summary
 
-At a high level, the system follows this flow:
+## Data Sources
 
-1. User submits a product, keyword, or market topic
-2. The agent pulls data from connected external sources
-3. Signals are cleaned and organized
-4. Trend, pricing, and discussion data are synthesized
-5. Forecasting logic is applied where appropriate
-6. A structured report is generated for the user
-7. The user can continue exploring through follow-up questions
+### Live sources
+- **NewsAPI**
+  - recent news coverage and article volume
+- **Google Trends / pytrends**
+  - search interest and momentum
+- **eBay pricing**
+  - live sold/completed pricing snapshots
+- **WTO trade/tariff data**
+  - tariff context and partner inference
+- **Stored local pricing history**
+  - historical weekly pricing continuity
 
-## Features
+### AI models
+- **OpenAI**
+  - planner
+  - Industry Context Agent
+  - Demand Specialist
+  - WTO Trade Evidence Agent
+  - final synthesis
+  - forecasting / scoring layers
+- **Claude**
+  - Market Constraints Specialist
 
-- Multi-source market signal collection
-- Modular agent-style workflow
-- Demand trend forecasting with ARIMA
-- Report generation for easy interpretation
-- Follow-up question support for iterative analysis
-- Extensible structure for additional APIs or data sources
+## Forecasting
+
+The system includes an ARIMA-based forecasting layer for Google Trends.
+
+Current forecasting behavior:
+- tests multiple ARIMA specifications
+- compares holdout RMSE
+- prefers models that:
+  - reject nonstationarity
+  - pass residual checks
+- falls back gracefully if no ideal model exists
+
+This helps avoid choosing a visually plausible but statistically weak forecast.
+
+## Key Features
+
+- Multi-agent market analysis
+- Live API evidence collection
+- Structured specialist outputs
+- ARIMA robustness checks
+- Downloadable HTML reports
+- UI sections for:
+  - workflow
+  - specialist agents
+  - signal scores
+  - pricing
+  - forecasting
+  - supporting evidence
 
 ## Example Use Cases
 
-This project can be adapted for use cases such as:
+- product demand validation
+- pricing and resale monitoring
+- trend analysis
+- trade/tariff risk awareness
+- market presentation support
+- rapid market-intelligence reporting
 
-- evaluating product demand before launching inventory
-- comparing price behavior across marketplaces
-- monitoring whether public interest in a niche product is accelerating
-- combining structured and unstructured signals into a single market brief
-- building a prototype market-research assistant
+## Project Goal
 
-## Tech Stack
+This project was built to explore how agentic AI can support market-intelligence workflows. Instead of just summarizing a prompt, the system coordinates live evidence gathering, specialist interpretation, and synthesis into a usable recommendation.
 
-The exact stack may vary by module, but the repository is built around ideas like:
+## Running Locally
 
-- Python / JavaScript-based agent workflows
-- external API integration
-- time-series modeling
-- report generation
-- front-end / back-end coordination for user interaction
-
-## Important Notes
-
-This project is intended as an analytical and educational build. Results depend heavily on:
-
-- the quality and availability of external data
-- API reliability and quota limits
-- search/query specificity
-- the time window being analyzed
-- the assumptions used in forecasting
-
-Forecast outputs should be interpreted as decision-support tools, not guarantees.
-
-## Repository Goals
-
-This repo demonstrates experience in:
-
-- building multi-step agent workflows
-- integrating several outside data sources into one pipeline
-- translating raw data into interpretable reports
-- combining forecasting with practical market analysis
-- designing user-facing analytics tooling
-
-## Possible Future Improvements
-
-Potential extensions include:
-
-- stronger entity resolution across product sources
-- more robust sentiment modeling
-- improved ranking/scoring logic for opportunities
-- additional forecasting models beyond ARIMA
-- dashboard deployment
-- automated alerting for major trend changes
-- benchmark backtesting of forecast quality
-
-## Disclaimer
-
-This project is for educational, research, and prototyping purposes. It should not be treated as financial advice, investment advice, or a guarantee of commercial performance.
+### 1. Create and activate a virtual environment
+```bash
+python -m venv venv
